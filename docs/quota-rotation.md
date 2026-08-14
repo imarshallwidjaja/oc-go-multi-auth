@@ -23,7 +23,7 @@ Successful ordinary requests continue to use that account when it remains the pr
 
 On every request, before the first upstream attempt, the plugin prefers an available `primary` over an available `overage_fallback`. If sticky is currently an overage fallback and any primary is available (enabled, not auth-blocked, cooldown finished), sticky switches to that primary and the request uses it once — no probing of other keys on that request.
 
-While all primaries are cooling or blocked, requests stay on the overage fallback with a single attempt (no extra latency). As soon as a primary becomes available again, the next request demotes sticky off overage. That keeps paid overages as a last resort without relying on a new OpenCode session.
+While all primaries are cooling or blocked, ordinary traversal stays on the overage fallback with a single attempt. Before that first overage attempt, the plugin may make a short advisory usage lookup against cooling primaries; uncertain or rate-limited guidance keeps the existing overage path. As soon as a primary becomes available again, the next request demotes sticky off overage. That keeps paid overages as a last resort without relying on a new OpenCode session.
 
 ## Rotatable Responses
 
@@ -86,6 +86,10 @@ Successful requests are not globally serialized. Each logical request receives a
 
 Every accepted success also records its request generation, including success on the current sticky account. Only a success newer than the last accepted success may change or persist the sticky account. An older success still returns to its caller but cannot steal stickiness after a newer request succeeds.
 
-## No Proactive Quota Detection
+## Advisory Usage at Overage Crossing
 
-The plugin does not query a dashboard or estimate token usage. Preference roles and response-driven cooldowns are the only signals used to leave an overage fallback. To inspect actual subscription quota, use [opencode.ai/auth](https://opencode.ai/auth).
+The plugin does not poll usage, estimate tokens, or probe on every request. The only independent usage lookup happens when ordinary traversal is about to choose the first `overage_fallback` for that logical request.
+
+At that boundary it concurrently queries `GET https://opencode.ai/zen/go/v1/usage` for enabled, unblocked, currently cooling, not-yet-attempted primaries. A strictly valid 200 payload whose rolling, weekly, and monthly windows are all `ok` permits exactly one advisory attempt of the first such primary in ring order. Any `rate-limited` window makes that candidate ineligible. Timeout, network failure, non-200, or malformed or oversized JSON fail open to the existing overage path and do not mutate account state.
+
+Usage data never changes blocked, cooldown, sticky, role, or persistence state by itself. The advisory attempt uses the same success and response-classification path as any other attempt. If a cooling primary becomes available while the lookup is in flight, the request re-runs ordinary selection and treats that primary as a normal attempt, not an advisory one. Immediately before each model attempt, the chosen credential is re-checked; an advisory primary or preserved overage that is no longer usable is skipped without sending that attempt, and ordinary selection continues. If the advisory attempt does not succeed, routing resumes the original overage candidate when it is still available; otherwise ordinary traversal continues. Caller cancellation during the advisory attempt or its response classification aborts the request and does not resume overage. Lookups are process-local, generation-scoped, and fail open; they are not scheduled from `resetInSec`. To inspect actual subscription quota yourself, use [opencode.ai/auth](https://opencode.ai/auth).

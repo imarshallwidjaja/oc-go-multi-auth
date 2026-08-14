@@ -70,6 +70,10 @@ OpenCode API call
 rotatingFetch(input, init)
          │
          ├── prefer available primary over sticky overage_fallback
+         ├── if first overage_fallback for this request
+         │     └── advisory GET /zen/go/v1/usage for cooling primaries
+         │           all-ok ──▶ one advisory primary attempt
+         │           else ──▶ keep overage candidate (fail open)
          ├── headers.set("Authorization", "Bearer <activeKey>")
          ├── await globalThis.fetch(input, headers)
          │
@@ -213,7 +217,9 @@ Wraps `globalThis.fetch` (or a provided `baseFetch`) to:
 6. **On ambiguous non-success:** Inspect a clone for at most 64 KiB and one second. Plain text uses terminal phrases; JSON uses allowlisted top-level or nested `error` code/type discriminators and selected message fields.
 7. **On overload or unknown 429:** Return the original response without rotating or penalizing the account. Explicit overload wins over `Retry-After`, which is not a standalone quota signal.
 8. **On success:** Accept the state mutation only when the attempt's account generation still matches. Clear a cooldown but never an auth block. A successful failover replacement updates the persisted rotation index only if no newer request has succeeded.
-9. **On unavailable candidates:** Probe the sticky enabled credential once. Return that response, or the last real response after a fully attempted traversal; never create a synthetic exhaustion response.
+9. **On initial all-unavailable entry:** Probe the sticky enabled credential once and return that real response. Never create a synthetic exhaustion response.
+10. **On mid-request stale exhaustion:** Return the last real response. If none exists, preserve or throw the existing transport or error terminal. Never probe blocked or already-attempted credentials, and never create a synthetic response.
+11. **On first overage crossing:** Before the first overage attempt, consult cooling primaries with a bounded usage lookup and allow at most one advisory primary attempt. Uncertainty fails open to the existing overage path only while the caller remains active; caller cancellation stops advisory classification and does not send overage. See [quota-rotation.md](./quota-rotation.md#advisory-usage-at-overage-crossing) for the full contract.
 
 Traversal state is request-scoped, so one logical request attempts each enabled, available credential at most once. Auth blocks and cooldown deadlines are process-local. Per-account availability generations reject stale success and penalty mutations. Global request-success ordering prevents an older request from changing or persisting stickiness after a newer request succeeds, without serializing requests.
 
@@ -308,5 +314,5 @@ The single auth method uses `type: "api"` for credential-based auth (**Add Go Ac
 
 - **API keys are stored in plaintext** on disk (`~/.config/opencode/`). Only the owner can read them (`0o600`).
 - **Keys are held in memory** for the duration of the session.
-- **No independent network calls** are made by the plugin — it only intercepts and may safely replay OpenCode's existing `opencode-go` API calls.
+- **Independent network calls** are limited to the advisory `GET https://opencode.ai/zen/go/v1/usage` lookup at the first primary-to-overage crossing. That request uses the captured underlying fetch and is never routed back through the interceptor. All other traffic is OpenCode's existing `opencode-go` API calls, which the plugin intercepts and may safely replay.
 - **No external dependencies** other than `@opencode-ai/plugin` for type definitions.

@@ -92,6 +92,8 @@ Or use **Settings → Auth → Set Go Account Role** and enter the list number p
 
 For the account count by role and raw persisted rotation values, run `oc-go-multi-auth status`.
 
+Primaries with OpenCode Go **Use balance** enabled may spend Zen balance without producing a rotatable failure. Disable Use balance on primary accounts when you want strict overage minimization.
+
 ---
 
 ## Removing an Account

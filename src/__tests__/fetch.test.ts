@@ -1,4 +1,5 @@
 import { describe, it, expect } from "bun:test"
+import { getEventListeners } from "node:events"
 import { createRotatingFetch } from "../fetch"
 import type { GoAccount } from "../types"
 
@@ -1235,6 +1236,53 @@ describe("createRotatingFetch", () => {
     expect(state.cooldownUntil.has(0)).toBe(false)
   })
 
+  it("does not resend the same overage credential after a delayed stale non-success", async () => {
+    const accounts = [mk("key-overage", true, "overage", "overage_fallback")]
+    const calls: string[] = []
+    let releaseOlder!: () => void
+    let markOlderStarted!: () => void
+    const olderStarted = new Promise<void>((resolve) => {
+      markOlderStarted = resolve
+    })
+    const delayedOlder = new Promise<Response>((resolve) => {
+      releaseOlder = () => resolve(mockRes(429, "quota exceeded"))
+    })
+    const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const authorization = requestHeaders(input, init).get("Authorization")!
+      const url = input instanceof Request ? input.url : input.toString()
+      calls.push(`${url} ${authorization}`)
+      if (url.endsWith("/older") && calls.filter((call) => call.includes("/older")).length === 1) {
+        markOlderStarted()
+        return delayedOlder
+      }
+      return mockRes(200)
+    }
+
+    const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+      logger: quietLogger,
+      now: () => 1_000,
+      wait: async () => {
+        throw new Error("unexpected wait")
+      },
+    })
+    state.activeIndex = 0
+
+    const older = fetch("https://api.example.com/older")
+    await olderStarted
+    expect((await fetch("https://api.example.com/newer")).status).toBe(200)
+    releaseOlder()
+    const olderResponse = await older
+    expect(olderResponse.status).toBe(429)
+    expect(await olderResponse.text()).toBe("quota exceeded")
+    expect(calls).toEqual([
+      "https://api.example.com/older Bearer key-overage",
+      "https://api.example.com/newer Bearer key-overage",
+    ])
+    expect(state.cooldownUntil.has(0)).toBe(false)
+    expect(state.blocked.size).toBe(0)
+    expect(state.activeIndex).toBe(0)
+  })
+
   it("does not permanently poison accounts when a quota sequence ends in engine overload", async () => {
     const accounts = [mk("key-a"), mk("key-b"), mk("key-c"), mk("key-d")]
     const authHeaders: string[] = []
@@ -1393,6 +1441,8 @@ describe("createRotatingFetch", () => {
     const waits: number[] = []
     let callCount = 0
     const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input)
+      if (url === "https://opencode.ai/zen/go/v1/usage") return mockRes(200, "not-json")
       const authorization = requestHeaders(input, init).get("Authorization")!
       authHeaders.push(authorization)
       callCount++
@@ -1451,5 +1501,1493 @@ describe("createRotatingFetch", () => {
     expect((await fetch("https://api.example.com")).status).toBe(200)
     expect(authHeaders).toEqual(["Bearer key-a", "Bearer key-b"])
     expect(state.activeIndex).toBe(2)
+  })
+
+  const USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
+
+  function requestUrl(input: RequestInfo | URL) {
+    return input instanceof Request ? input.url : String(input)
+  }
+
+  function isUsageRequest(input: RequestInfo | URL) {
+    return requestUrl(input) === USAGE_URL
+  }
+
+  function usageWindow(status: "ok" | "rate-limited", usagePercent = 12, resetInSec = 90) {
+    return { status, usagePercent, resetInSec }
+  }
+
+  function usageBody(overrides: Record<string, unknown> = {}) {
+    return {
+      useBalance: false,
+      rollingUsage: usageWindow("ok"),
+      weeklyUsage: usageWindow("ok"),
+      monthlyUsage: usageWindow("ok"),
+      ...overrides,
+    }
+  }
+
+  function usageResponse(body: unknown = usageBody(), status = 200, headers?: HeadersInit) {
+    return mockRes(status, typeof body === "string" ? body : JSON.stringify(body), {
+      "content-type": "application/json",
+      ...headers,
+    })
+  }
+
+  describe("advisory usage at overage crossing", () => {
+    it("does not look up usage while a normal primary is available", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      const urls: string[] = []
+      const baseFetch = async (input: RequestInfo | URL) => {
+        urls.push(requestUrl(input))
+        return mockRes(200)
+      }
+
+      const { fetch } = createRotatingFetch(accounts, -1, baseFetch, { logger: quietLogger })
+      expect((await fetch("https://api.example.com/available")).status).toBe(200)
+      expect(urls).toEqual(["https://api.example.com/available"])
+    })
+
+    it("recovers one cooling primary when all usage windows are ok", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      const usageAuth: string[] = []
+      const usageMethods: string[] = []
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageAuth.push(requestHeaders(input, init).get("Authorization")!)
+          usageMethods.push(input instanceof Request ? input.method : init?.method ?? "GET")
+          return usageResponse(usageBody({ extra: "tolerated", rollingUsage: { ...usageWindow("ok"), extra: 1 } }))
+        }
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      expect((await fetch("https://api.example.com/recover")).status).toBe(200)
+      expect(usageAuth).toEqual(["Bearer key-primary"])
+      expect(usageMethods).toEqual(["GET"])
+      expect(upstreamAuth).toEqual(["Bearer key-primary"])
+      expect(state.activeIndex).toBe(0)
+      expect(state.cooldownUntil.has(0)).toBe(false)
+    })
+
+    for (const window of ["rollingUsage", "weeklyUsage", "monthlyUsage"] as const) {
+      it(`keeps overage when ${window} is rate-limited`, async () => {
+        const accounts = [
+          mk("key-primary", true, "primary", "primary"),
+          mk("key-overage", true, "overage", "overage_fallback"),
+        ]
+        const upstreamAuth: string[] = []
+        const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (isUsageRequest(input)) return usageResponse(usageBody({ [window]: usageWindow("rate-limited") }))
+          upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+          return mockRes(200)
+        }
+
+        const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+          logger: quietLogger,
+          now: () => 1_000,
+        })
+        state.activeIndex = 1
+        state.cooldownUntil.set(0, 61_000)
+
+        expect((await fetch("https://api.example.com/limited")).status).toBe(200)
+        expect(upstreamAuth).toEqual(["Bearer key-overage"])
+        expect(state.activeIndex).toBe(1)
+        expect(state.cooldownUntil.get(0)).toBe(61_000)
+        expect(state.blocked.size).toBe(0)
+      })
+    }
+
+    it("fails open to overage when usage lookup exceeds 750ms", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) return new Promise<Response>(() => {})
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      const started = Date.now()
+      expect((await fetch("https://api.example.com/fail-open-timeout")).status).toBe(200)
+      expect(Date.now() - started).toBeGreaterThanOrEqual(750)
+      expect(upstreamAuth).toEqual(["Bearer key-overage"])
+      expect(state.activeIndex).toBe(1)
+      expect(state.cooldownUntil.get(0)).toBe(61_000)
+      expect(state.blocked.size).toBe(0)
+    })
+
+    it("does not surface an unhandled rejection when usage lookup rejects after the 750ms timeout", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      const rejections: unknown[] = []
+      const onUnhandled = (reason: unknown) => {
+        rejections.push(reason)
+      }
+      process.on("unhandledRejection", onUnhandled)
+      let rejectUsage!: (error: Error) => void
+      const usageGate = new Promise<Response>((_resolve, reject) => {
+        rejectUsage = reject
+      })
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) return usageGate
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      try {
+        expect((await fetch("https://api.example.com/late-reject")).status).toBe(200)
+        expect(upstreamAuth).toEqual(["Bearer key-overage"])
+        rejectUsage(new Error("late usage rejection"))
+        await Promise.resolve()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(rejections).toEqual([])
+      } finally {
+        process.off("unhandledRejection", onUnhandled)
+      }
+    })
+
+    for (const testCase of [
+      {
+        name: "network failure",
+        usage: async () => {
+          throw new TypeError("usage network down")
+        },
+      },
+      { name: "401", usage: async () => usageResponse("unauthorized", 401) },
+      { name: "malformed JSON", usage: async () => usageResponse("not-json") },
+      { name: "oversized content-length", usage: async () => usageResponse(usageBody(), 200, { "content-length": "999999" }) },
+      { name: "missing windows", usage: async () => usageResponse({ useBalance: false }) },
+      { name: "non-boolean useBalance", usage: async () => usageResponse(usageBody({ useBalance: "yes" })) },
+      { name: "invalid status", usage: async () => usageResponse(usageBody({ rollingUsage: usageWindow("OK" as "ok") })) },
+      { name: "usagePercent over 100", usage: async () => usageResponse(usageBody({ weeklyUsage: usageWindow("ok", 101) })) },
+      { name: "negative resetInSec", usage: async () => usageResponse(usageBody({ monthlyUsage: usageWindow("ok", 10, -1) })) },
+    ]) {
+      it(`fails open to overage on ${testCase.name}`, async () => {
+        const accounts = [
+          mk("key-primary", true, "primary", "primary"),
+          mk("key-overage", true, "overage", "overage_fallback"),
+        ]
+        const upstreamAuth: string[] = []
+        const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (isUsageRequest(input)) return testCase.usage()
+          upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+          return mockRes(200)
+        }
+
+        const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+          logger: quietLogger,
+          now: () => 1_000,
+        })
+        state.activeIndex = 1
+        state.cooldownUntil.set(0, 61_000)
+
+        expect((await fetch("https://api.example.com/fail-open")).status).toBe(200)
+        expect(upstreamAuth).toEqual(["Bearer key-overage"])
+        expect(state.activeIndex).toBe(1)
+        expect(state.cooldownUntil.get(0)).toBe(61_000)
+        expect(state.blocked.size).toBe(0)
+      })
+    }
+
+    it("resumes the original overage after advisory quota failure when another overage exists", async () => {
+      const accounts = [
+        mk("key-overage-a", true, "overage-a", "overage_fallback"),
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage-b", true, "overage-b", "overage_fallback"),
+      ]
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) return usageResponse()
+        const authorization = requestHeaders(input, init).get("Authorization")!
+        upstreamAuth.push(authorization)
+        return authorization === "Bearer key-primary"
+          ? mockRes(429, "quota exceeded")
+          : mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 0
+      state.cooldownUntil.set(1, 61_000)
+
+      expect((await fetch("https://api.example.com/resume-overage-quota")).status).toBe(200)
+      expect(upstreamAuth).toEqual(["Bearer key-primary", "Bearer key-overage-a"])
+      expect(state.activeIndex).toBe(0)
+    })
+
+    it("resumes the original overage after advisory transport failure when another overage exists", async () => {
+      const accounts = [
+        mk("key-overage-a", true, "overage-a", "overage_fallback"),
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage-b", true, "overage-b", "overage_fallback"),
+      ]
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) return usageResponse()
+        const authorization = requestHeaders(input, init).get("Authorization")!
+        upstreamAuth.push(authorization)
+        if (authorization === "Bearer key-primary") throw new TypeError("advisory network")
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 0
+      state.cooldownUntil.set(1, 61_000)
+
+      expect((await fetch("https://api.example.com/resume-overage-transport")).status).toBe(200)
+      expect(upstreamAuth).toEqual(["Bearer key-primary", "Bearer key-overage-a"])
+      expect(state.activeIndex).toBe(0)
+      expect(state.blocked.size).toBe(0)
+    })
+
+    it("uses ordinary traversal when the original overage is unavailable after advisory failure", async () => {
+      const accounts = [
+        mk("key-overage-a", true, "overage-a", "overage_fallback"),
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage-b", true, "overage-b", "overage_fallback"),
+      ]
+      const upstreamAuth: string[] = []
+      const { fetch, state } = createRotatingFetch(accounts, -1, async (input, init) => {
+        if (isUsageRequest(input)) return usageResponse()
+        const authorization = requestHeaders(input, init).get("Authorization")!
+        upstreamAuth.push(authorization)
+        if (authorization === "Bearer key-primary") {
+          state.blocked.add(0)
+          return mockRes(429, "quota exceeded")
+        }
+        return mockRes(200)
+      }, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 0
+      state.cooldownUntil.set(1, 61_000)
+
+      expect((await fetch("https://api.example.com/resume-overage-unavailable")).status).toBe(200)
+      expect(upstreamAuth).toEqual(["Bearer key-primary", "Bearer key-overage-b"])
+      expect(state.activeIndex).toBe(2)
+    })
+
+    it("queries cooling primaries concurrently and makes only one advisory attempt", async () => {
+      const accounts = [
+        mk("key-a", true, "a", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+        mk("key-b", true, "b", "primary"),
+      ]
+      let usageInFlight = 0
+      let usagePeak = 0
+      const usageAuth: string[] = []
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageAuth.push(requestHeaders(input, init).get("Authorization")!)
+          usageInFlight++
+          usagePeak = Math.max(usagePeak, usageInFlight)
+          await Promise.resolve()
+          usageInFlight--
+          return usageResponse()
+        }
+        const authorization = requestHeaders(input, init).get("Authorization")!
+        upstreamAuth.push(authorization)
+        return authorization === "Bearer key-b"
+          ? mockRes(429, "quota exceeded")
+          : mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+      state.cooldownUntil.set(2, 61_000)
+
+      expect((await fetch("https://api.example.com/one-attempt")).status).toBe(200)
+      expect(new Set(usageAuth)).toEqual(new Set(["Bearer key-a", "Bearer key-b"]))
+      expect(usagePeak).toBe(2)
+      expect(upstreamAuth).toEqual(["Bearer key-b", "Bearer key-overage"])
+    })
+
+    it("does not query disabled, blocked, available, or already-attempted primaries", async () => {
+      const accounts = [
+        mk("key-disabled", true, "disabled", "primary"),
+        mk("key-blocked", true, "blocked", "primary"),
+        mk("key-attempted", true, "attempted", "primary"),
+        mk("key-cool", true, "cool", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      accounts[0].enabled = false
+      const usageAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageAuth.push(requestHeaders(input, init).get("Authorization")!)
+          return usageResponse()
+        }
+        const authorization = requestHeaders(input, init).get("Authorization")!
+        return authorization === "Bearer key-attempted"
+          ? mockRes(429, "quota exceeded")
+          : mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.blocked.add(1)
+      state.cooldownUntil.set(3, 61_000)
+
+      expect((await fetch("https://api.example.com/filter")).status).toBe(200)
+      expect(usageAuth).toEqual(["Bearer key-cool"])
+    })
+
+    it("reuses a process-local usage cache within the TTL", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      let usageCalls = 0
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageCalls++
+          return usageResponse(usageBody({ rollingUsage: usageWindow("rate-limited") }))
+        }
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return mockRes(200)
+      }
+
+      let now = 1_000
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => now,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      expect((await fetch("https://api.example.com/cache-1")).status).toBe(200)
+      now = 5_999
+      expect((await fetch("https://api.example.com/cache-2")).status).toBe(200)
+      expect(usageCalls).toBe(1)
+      now = 6_001
+      expect((await fetch("https://api.example.com/cache-3")).status).toBe(200)
+      expect(usageCalls).toBe(2)
+      expect(upstreamAuth).toEqual(["Bearer key-overage", "Bearer key-overage", "Bearer key-overage"])
+    })
+
+    it("deduplicates in-flight usage lookups across concurrent requests", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      let usageCalls = 0
+      let releaseUsage!: (response: Response) => void
+      const usageGate = new Promise<Response>((resolve) => {
+        releaseUsage = resolve
+      })
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageCalls++
+          return usageGate
+        }
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      const first = fetch("https://api.example.com/inflight-1")
+      const second = fetch("https://api.example.com/inflight-2")
+      await Promise.resolve()
+      expect(usageCalls).toBe(1)
+      releaseUsage(usageResponse())
+      expect((await first).status).toBe(200)
+      expect((await second).status).toBe(200)
+      expect(usageCalls).toBe(1)
+      expect(upstreamAuth).toEqual(["Bearer key-primary", "Bearer key-primary"])
+    })
+
+    it("rejects a stale usage result after availability generation changes", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      let releaseUsage!: (response: Response) => void
+      const usageGate = new Promise<Response>((resolve) => {
+        releaseUsage = resolve
+      })
+      let usageStarted!: () => void
+      const usageReady = new Promise<void>((resolve) => {
+        usageStarted = resolve
+      })
+      const upstreamAuth: string[] = []
+      let now = 1_000
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageStarted()
+          return usageGate
+        }
+        const authorization = requestHeaders(input, init).get("Authorization")!
+        upstreamAuth.push(authorization)
+        return authorization === "Bearer key-primary"
+          ? mockRes(429, "quota exceeded")
+          : mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => now,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 2_000)
+
+      const waiting = fetch("https://api.example.com/stale-gen")
+      await usageReady
+      now = 2_000
+      expect((await fetch("https://api.example.com/bump-gen")).status).toBe(200)
+      releaseUsage(usageResponse())
+      expect((await waiting).status).toBe(200)
+      expect(upstreamAuth.filter((header) => header === "Bearer key-primary")).toEqual(["Bearer key-primary"])
+      expect(upstreamAuth.filter((header) => header === "Bearer key-overage").length).toBeGreaterThanOrEqual(1)
+      expect(state.activeIndex).toBe(1)
+    })
+
+    it("rejects a stale usage result when the candidate is no longer eligible", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      let releaseUsage!: (response: Response) => void
+      const usageGate = new Promise<Response>((resolve) => {
+        releaseUsage = resolve
+      })
+      let usageStarted!: () => void
+      const usageReady = new Promise<void>((resolve) => {
+        usageStarted = resolve
+      })
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageStarted()
+          return usageGate
+        }
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      const waiting = fetch("https://api.example.com/stale-state")
+      await usageReady
+      state.blocked.add(0)
+      releaseUsage(usageResponse())
+      expect((await waiting).status).toBe(200)
+      expect(upstreamAuth).toEqual(["Bearer key-overage"])
+    })
+
+    it("does not send a model request after a selected advisory primary becomes unavailable", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      let releaseUsage!: (response: Response) => void
+      const usageGate = new Promise<Response>((resolve) => {
+        releaseUsage = resolve
+      })
+      let usageStarted!: () => void
+      const usageReady = new Promise<void>((resolve) => {
+        usageStarted = resolve
+      })
+      const upstreamAuth: string[] = []
+      let usageCalls = 0
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageCalls++
+          usageStarted()
+          return usageGate
+        }
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+      const rawGet = state.cooldownUntil.get.bind(state.cooldownUntil)
+      let armMutation = false
+      state.cooldownUntil.get = (index: number) => {
+        const value = rawGet(index)
+        if (armMutation && index === 0) {
+          armMutation = false
+          queueMicrotask(() => {
+            state.blocked.add(0)
+          })
+        }
+        return value
+      }
+
+      const waiting = fetch("https://api.example.com/advisory-after-select")
+      await usageReady
+      armMutation = true
+      releaseUsage(usageResponse())
+      expect((await waiting).status).toBe(200)
+      expect(upstreamAuth).toEqual(["Bearer key-overage"])
+      expect(usageCalls).toBe(1)
+      expect(state.blocked.has(0)).toBe(true)
+      expect(state.cooldownUntil.get(0)).toBe(61_000)
+    })
+
+    for (const testCase of [
+      {
+        name: "blocked",
+        mutate: (state: { blocked: Set<number>; cooldownUntil: Map<number, number> }, accounts: GoAccount[]) => {
+          state.blocked.add(0)
+        },
+      },
+      {
+        name: "disabled",
+        mutate: (state: { blocked: Set<number>; cooldownUntil: Map<number, number> }, accounts: GoAccount[]) => {
+          accounts[0].enabled = false
+        },
+      },
+      {
+        name: "cooling",
+        mutate: (state: { blocked: Set<number>; cooldownUntil: Map<number, number> }, accounts: GoAccount[]) => {
+          state.cooldownUntil.set(0, 61_000)
+        },
+      },
+    ]) {
+      it(`does not send the original overage after it becomes ${testCase.name} during usage lookup`, async () => {
+        const accounts = [
+          mk("key-overage-a", true, "overage-a", "overage_fallback"),
+          mk("key-primary", true, "primary", "primary"),
+          mk("key-overage-b", true, "overage-b", "overage_fallback"),
+        ]
+        let releaseUsage!: (response: Response) => void
+        const usageGate = new Promise<Response>((resolve) => {
+          releaseUsage = resolve
+        })
+        let usageStarted!: () => void
+        const usageReady = new Promise<void>((resolve) => {
+          usageStarted = resolve
+        })
+        const upstreamAuth: string[] = []
+        let usageCalls = 0
+        const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (isUsageRequest(input)) {
+            usageCalls++
+            usageStarted()
+            return usageGate
+          }
+          upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+          return mockRes(200)
+        }
+
+        const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+          logger: quietLogger,
+          now: () => 1_000,
+        })
+        state.activeIndex = 0
+        state.cooldownUntil.set(1, 61_000)
+
+        const waiting = fetch("https://api.example.com/overage-stale")
+        await usageReady
+        testCase.mutate(state, accounts)
+        releaseUsage(usageResponse(usageBody({ rollingUsage: usageWindow("rate-limited") })))
+        expect((await waiting).status).toBe(200)
+        expect(upstreamAuth).toEqual(["Bearer key-overage-b"])
+        expect(usageCalls).toBe(1)
+      })
+    }
+
+    it("does not send a selected overage that becomes blocked before the model attempt", async () => {
+      const accounts = [
+        mk("key-overage", true, "overage", "overage_fallback"),
+        mk("key-primary", true, "primary", "primary"),
+      ]
+      let releaseUsage!: (response: Response) => void
+      const usageGate = new Promise<Response>((resolve) => {
+        releaseUsage = resolve
+      })
+      let usageStarted!: () => void
+      const usageReady = new Promise<void>((resolve) => {
+        usageStarted = resolve
+      })
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageStarted()
+          return usageGate
+        }
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+        wait: async () => {
+          throw new Error("unexpected wait")
+        },
+      })
+      state.activeIndex = 0
+      state.cooldownUntil.set(1, 61_000)
+
+      const waiting = fetch("https://api.example.com/blocked-overage-before-send")
+      await usageReady
+      state.blocked.add(0)
+      state.blocked.add(1)
+      releaseUsage(usageResponse(usageBody({ rollingUsage: usageWindow("rate-limited") })))
+
+      await expect(waiting).rejects.toThrow("No enabled Go accounts")
+      expect(upstreamAuth).toEqual([])
+    })
+
+    it("does not retry an already-attempted primary after stale reselection exhaustion", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+        mk("key-cooling", true, "cooling", "primary"),
+      ]
+      let releaseUsage!: (response: Response) => void
+      const usageGate = new Promise<Response>((resolve) => {
+        releaseUsage = resolve
+      })
+      let usageStarted!: () => void
+      const usageReady = new Promise<void>((resolve) => {
+        usageStarted = resolve
+      })
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageStarted()
+          return usageGate
+        }
+        const authorization = requestHeaders(input, init).get("Authorization")!
+        upstreamAuth.push(authorization)
+        return authorization === "Bearer key-primary"
+          ? mockRes(401, "primary-auth-failure")
+          : mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+        wait: async () => {
+          throw new Error("unexpected wait")
+        },
+      })
+      state.activeIndex = 0
+      state.cooldownUntil.set(2, 61_000)
+
+      const waiting = fetch("https://api.example.com/primary-twice")
+      await usageReady
+      state.blocked.add(1)
+      state.blocked.add(2)
+      releaseUsage(usageResponse(usageBody({ rollingUsage: usageWindow("rate-limited") })))
+
+      const response = await waiting
+      expect(upstreamAuth).toEqual(["Bearer key-primary"])
+      expect(response.status).toBe(401)
+      expect(await response.text()).toBe("primary-auth-failure")
+    })
+
+    it("clears the attempted pass after a real recovery wait and retries the recovered primary", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+        mk("key-cooling", true, "cooling", "primary"),
+      ]
+      let releaseUsage!: (response: Response) => void
+      const usageGate = new Promise<Response>((resolve) => {
+        releaseUsage = resolve
+      })
+      let usageStarted!: () => void
+      const usageReady = new Promise<void>((resolve) => {
+        usageStarted = resolve
+      })
+      let now = 1_000
+      const waits: number[] = []
+      let cancelCalls = 0
+      const upstreamAuth: string[] = []
+      const retained = mockRes(429, "quota exceeded")
+      retained.body!.cancel = () => {
+        cancelCalls++
+        return new Promise(() => {})
+      }
+      let primaryCalls = 0
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageStarted()
+          return usageGate
+        }
+        const authorization = requestHeaders(input, init).get("Authorization")!
+        upstreamAuth.push(authorization)
+        if (authorization === "Bearer key-primary") {
+          primaryCalls++
+          return primaryCalls === 1 ? retained : mockRes(200)
+        }
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => now,
+        wait: async (delayMs) => {
+          waits.push(delayMs)
+          now += delayMs
+        },
+      })
+      state.cooldownUntil.set(2, 61_000)
+
+      const pending = fetch("https://api.example.com/recover-after-wait")
+      await usageReady
+      state.blocked.add(1)
+      state.blocked.add(2)
+      releaseUsage(usageResponse(usageBody({ rollingUsage: usageWindow("rate-limited") })))
+
+      const response = await pending
+      expect(response.status).toBe(200)
+      expect(upstreamAuth).toEqual(["Bearer key-primary", "Bearer key-primary"])
+      expect(waits).toEqual([60_000])
+      expect(cancelCalls).toBe(1)
+      expect(retained.body?.locked).toBe(false)
+      expect(state.blocked.has(1)).toBe(true)
+      expect(state.blocked.has(2)).toBe(true)
+    })
+
+    it("fails open and releases a stalled usage body reader at the 750ms bound", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      let cancelCalled = false
+      let usageSignal: AbortSignal | undefined
+      const rejections: unknown[] = []
+      const onUnhandled = (reason: unknown) => {
+        rejections.push(reason)
+      }
+      process.on("unhandledRejection", onUnhandled)
+      const stream = new ReadableStream<Uint8Array>({
+        pull() {},
+        cancel() {
+          cancelCalled = true
+          return new Promise(() => {})
+        },
+      })
+      const stalled = new Response(stream, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageSignal = input instanceof Request ? input.signal : init?.signal
+          return stalled
+        }
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      const started = Date.now()
+      try {
+        expect((await fetch("https://api.example.com/stalled-body")).status).toBe(200)
+        expect(Date.now() - started).toBeGreaterThanOrEqual(750)
+        expect(upstreamAuth).toEqual(["Bearer key-overage"])
+        expect(cancelCalled).toBe(true)
+        expect(stalled.body?.locked).toBe(false)
+        expect(usageSignal ? getEventListeners(usageSignal, "abort") : ["missing"]).toHaveLength(0)
+        await Promise.resolve()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(rejections).toEqual([])
+        expect(state.activeIndex).toBe(1)
+        expect(state.cooldownUntil.get(0)).toBe(61_000)
+        expect(state.blocked.size).toBe(0)
+      } finally {
+        process.off("unhandledRejection", onUnhandled)
+      }
+    })
+
+    it("re-runs ordinary selection when usage returns after cooldown expires", async () => {
+      const accounts = [
+        mk("key-a", true, "a", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+        mk("key-b", true, "b", "primary"),
+      ]
+      let releaseUsage!: (response: Response) => void
+      const usageGate = new Promise<Response>((resolve) => {
+        releaseUsage = resolve
+      })
+      let usageStarted!: () => void
+      const usageReady = new Promise<void>((resolve) => {
+        usageStarted = resolve
+      })
+      const upstreamAuth: string[] = []
+      let usageCalls = 0
+      let now = 1_000
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageCalls++
+          usageStarted()
+          return usageGate
+        }
+        const authorization = requestHeaders(input, init).get("Authorization")!
+        upstreamAuth.push(authorization)
+        return authorization === "Bearer key-b"
+          ? mockRes(429, "quota exceeded")
+          : mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => now,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 2_000)
+      state.cooldownUntil.set(2, 2_000)
+
+      const pending = fetch("https://api.example.com/expired-cooldown")
+      await usageReady
+      now = 2_000
+      releaseUsage(usageResponse())
+      expect((await pending).status).toBe(200)
+      expect(usageCalls).toBe(2)
+      expect(upstreamAuth).toEqual(["Bearer key-b", "Bearer key-a"])
+      expect(state.activeIndex).toBe(0)
+    })
+
+    it("does not route the usage lookup through rotating fetch", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      let usageCalls = 0
+      const urls: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        urls.push(requestUrl(input))
+        if (isUsageRequest(input)) {
+          usageCalls++
+          expect(input instanceof Request ? input.method : init?.method ?? "GET").toBe("GET")
+          return usageResponse("unauthorized", 401)
+        }
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      expect((await fetch("https://api.example.com/no-recurse")).status).toBe(200)
+      expect(usageCalls).toBe(1)
+      expect(urls.filter((url) => url === USAGE_URL)).toHaveLength(1)
+      expect(state.blocked.size).toBe(0)
+      expect(state.cooldownUntil.get(0)).toBe(61_000)
+    })
+
+    it("does not start usage lookup when the caller is already aborted at an overage crossing", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      const abort = new Error("already aborted")
+      const controller = new AbortController()
+      controller.abort(abort)
+      let calls = 0
+      const baseFetch = async () => {
+        calls++
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      await expect(fetch("https://api.example.com/pre-aborted", { signal: controller.signal })).rejects.toBe(abort)
+      expect(calls).toBe(0)
+    })
+
+    it("propagates caller abort while waiting for usage and keeps the shared lookup", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      const abort = new Error("caller cancelled")
+      let usageCalls = 0
+      let usageSignal: AbortSignal | undefined
+      let releaseUsage!: (response: Response) => void
+      const usageGate = new Promise<Response>((resolve) => {
+        releaseUsage = resolve
+      })
+      let usageStarted!: () => void
+      const usageReady = new Promise<void>((resolve) => {
+        usageStarted = resolve
+      })
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageCalls++
+          usageSignal = input instanceof Request ? input.signal : init?.signal
+          usageStarted()
+          return usageGate
+        }
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      const controller = new AbortController()
+      const pending = fetch("https://api.example.com/abort-wait", { signal: controller.signal })
+      await usageReady
+      controller.abort(abort)
+      await expect(pending).rejects.toBe(abort)
+      expect(usageSignal?.aborted).toBe(false)
+
+      releaseUsage(usageResponse())
+      expect((await fetch("https://api.example.com/after-abort")).status).toBe(200)
+      expect(usageCalls).toBe(1)
+      expect(upstreamAuth).toEqual(["Bearer key-primary"])
+    })
+
+    it("does not send the fail-open overage model request when the caller aborts after usage settles", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      const abort = new Error("caller cancelled after usage settled")
+      const controller = new AbortController()
+      let usageCalls = 0
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageCalls++
+          return usageResponse(usageBody({ rollingUsage: usageWindow("rate-limited") }))
+        }
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return mockRes(200)
+      }
+
+      let armed = false
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => {
+          if (usageCalls > 0 && armed) controller.abort(abort)
+          armed = usageCalls > 0
+          return 1_000
+        },
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      await expect(fetch("https://api.example.com/abort-after-usage", { signal: controller.signal })).rejects.toBe(abort)
+      expect(upstreamAuth).toEqual([])
+      expect(usageCalls).toBe(1)
+      expect(state.activeIndex).toBe(1)
+      expect(state.cooldownUntil.get(0)).toBe(61_000)
+      expect(state.blocked.size).toBe(0)
+    })
+
+    it("propagates caller abort during advisory classification and does not send overage", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      const abort = new Error("caller cancelled during classification")
+      let cancelCalled = false
+      let cloned: Response | undefined
+      const rejections: unknown[] = []
+      const onUnhandled = (reason: unknown) => {
+        rejections.push(reason)
+      }
+      process.on("unhandledRejection", onUnhandled)
+      const stream = new ReadableStream<Uint8Array>({
+        pull() {},
+        cancel() {
+          cancelCalled = true
+          return new Promise(() => {})
+        },
+      })
+      const stalled = new Response(stream, {
+        status: 403,
+        headers: { "content-type": "text/plain" },
+      })
+      const originalClone = stalled.clone.bind(stalled)
+      let classificationStarted!: () => void
+      const classificationReady = new Promise<void>((resolve) => {
+        classificationStarted = resolve
+      })
+      stalled.clone = () => {
+        cloned = originalClone()
+        classificationStarted()
+        return cloned
+      }
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) return usageResponse()
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return requestHeaders(input, init).get("Authorization") === "Bearer key-primary"
+          ? stalled
+          : mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+        inspectionTimeoutMs: 250,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      const controller = new AbortController()
+      try {
+        const pending = fetch("https://api.example.com/abort-classify", { signal: controller.signal })
+        await classificationReady
+        controller.abort(abort)
+        await expect(pending).rejects.toBe(abort)
+        expect(upstreamAuth).toEqual(["Bearer key-primary"])
+        expect(cancelCalled).toBe(true)
+        expect(cloned?.body?.locked).toBe(false)
+        expect(stalled.body?.locked).toBe(false)
+        expect(getEventListeners(controller.signal, "abort")).toHaveLength(0)
+        await Promise.resolve()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(rejections).toEqual([])
+        expect(state.activeIndex).toBe(1)
+        expect(state.cooldownUntil.get(0)).toBe(61_000)
+        expect(state.blocked.size).toBe(0)
+      } finally {
+        process.off("unhandledRejection", onUnhandled)
+      }
+    })
+
+    it("cancels the current model response when caller aborts during post-response usage consultation", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+        mk("key-cooling", true, "cooling", "primary"),
+      ]
+      const abort = new Error("caller cancelled during post-response consult")
+      let cancelCalls = 0
+      const rejections: unknown[] = []
+      const onUnhandled = (reason: unknown) => {
+        rejections.push(reason)
+      }
+      process.on("unhandledRejection", onUnhandled)
+      const quota = mockRes(429, "quota exceeded")
+      quota.body!.cancel = () => {
+        cancelCalls++
+        return new Promise(() => {})
+      }
+      let releaseUsage!: (response: Response) => void
+      const usageGate = new Promise<Response>((resolve) => {
+        releaseUsage = resolve
+      })
+      let usageStarted!: () => void
+      const usageReady = new Promise<void>((resolve) => {
+        usageStarted = resolve
+      })
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageStarted()
+          return usageGate
+        }
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return requestHeaders(input, init).get("Authorization") === "Bearer key-primary"
+          ? quota
+          : mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 0
+      state.cooldownUntil.set(2, 61_000)
+
+      const controller = new AbortController()
+      try {
+        const pending = fetch("https://api.example.com/abort-post-response-consult", { signal: controller.signal })
+        await usageReady
+        controller.abort(abort)
+        await expect(pending).rejects.toBe(abort)
+        expect(upstreamAuth).toEqual(["Bearer key-primary"])
+        expect(cancelCalls).toBe(1)
+        expect(quota.body?.locked).toBe(false)
+        expect(getEventListeners(controller.signal, "abort")).toHaveLength(0)
+        await Promise.resolve()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(rejections).toEqual([])
+        expect(state.activeIndex).toBe(0)
+        expect(state.blocked.size).toBe(0)
+      } finally {
+        process.off("unhandledRejection", onUnhandled)
+        releaseUsage(usageResponse())
+      }
+    })
+
+    it("rejects caller abort instead of returning a retained response when the final candidate is exhausted", async () => {
+      const accounts = [
+        mk("key-a", true, "a", "primary"),
+        mk("key-b", true, "b", "primary"),
+      ]
+      const abort = new Error("caller cancelled before retained terminal return")
+      const controller = new AbortController()
+      let cancelCalls = 0
+      const rejections: unknown[] = []
+      const onUnhandled = (reason: unknown) => {
+        rejections.push(reason)
+      }
+      process.on("unhandledRejection", onUnhandled)
+      const retained = mockRes(401, "primary-auth-failure")
+      retained.body!.cancel = () => {
+        cancelCalls++
+        return new Promise(() => {})
+      }
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return requestHeaders(input, init).get("Authorization") === "Bearer key-a"
+          ? retained
+          : mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: (_level, msg) => {
+          if (msg === "credential rotation") {
+            state.blocked.add(1)
+            controller.abort(abort)
+          }
+        },
+        now: () => 1_000,
+        wait: async () => {
+          throw new Error("unexpected wait")
+        },
+      })
+
+      try {
+        await expect(fetch("https://api.example.com/abort-retained-terminal", { signal: controller.signal })).rejects.toBe(abort)
+        expect(upstreamAuth).toEqual(["Bearer key-a"])
+        expect(cancelCalls).toBe(1)
+        expect(retained.body?.locked).toBe(false)
+        expect(getEventListeners(controller.signal, "abort")).toHaveLength(0)
+        await Promise.resolve()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(rejections).toEqual([])
+        expect(state.activeIndex).toBe(0)
+        expect(state.blocked).toEqual(new Set([0, 1]))
+      } finally {
+        process.off("unhandledRejection", onUnhandled)
+      }
+    })
+
+    it("cancels the retained response when caller aborts during pre-response usage consultation", async () => {
+      const accounts = [
+        mk("key-a", true, "a", "primary"),
+        mk("key-b", true, "b", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+        mk("key-cooling", true, "cooling", "primary"),
+      ]
+      const abort = new Error("caller cancelled during pre-response consult")
+      const controller = new AbortController()
+      let cancelCalls = 0
+      const rejections: unknown[] = []
+      const onUnhandled = (reason: unknown) => {
+        rejections.push(reason)
+      }
+      process.on("unhandledRejection", onUnhandled)
+      const retained = mockRes(401, "primary-auth-failure")
+      retained.body!.cancel = () => {
+        cancelCalls++
+        return new Promise(() => {})
+      }
+      let releaseUsage!: (response: Response) => void
+      const usageGate = new Promise<Response>((resolve) => {
+        releaseUsage = resolve
+      })
+      let usageStarted!: () => void
+      const usageReady = new Promise<void>((resolve) => {
+        usageStarted = resolve
+      })
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) {
+          usageStarted()
+          return usageGate
+        }
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return requestHeaders(input, init).get("Authorization") === "Bearer key-a"
+          ? retained
+          : mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: (_level, msg) => {
+          if (msg === "credential rotation") state.blocked.add(1)
+        },
+        now: () => 1_000,
+        wait: async () => {
+          throw new Error("unexpected wait")
+        },
+      })
+      state.cooldownUntil.set(3, 61_000)
+
+      try {
+        const pending = fetch("https://api.example.com/abort-pre-response-consult", { signal: controller.signal })
+        await usageReady
+        controller.abort(abort)
+        await expect(pending).rejects.toBe(abort)
+        expect(upstreamAuth).toEqual(["Bearer key-a"])
+        expect(cancelCalls).toBe(1)
+        expect(retained.body?.locked).toBe(false)
+        expect(getEventListeners(controller.signal, "abort")).toHaveLength(0)
+        await Promise.resolve()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(rejections).toEqual([])
+        expect(state.activeIndex).toBe(0)
+        expect(state.blocked.has(0)).toBe(true)
+        expect(state.blocked.has(1)).toBe(true)
+      } finally {
+        process.off("unhandledRejection", onUnhandled)
+        releaseUsage(usageResponse())
+      }
+    })
+
+    it("cancels the retained response when caller aborts during recovery wait", async () => {
+      const accounts = [
+        mk("key-a", true, "a", "primary"),
+        mk("key-b", true, "b", "primary"),
+        mk("key-cooling", true, "cooling", "primary"),
+      ]
+      const abort = new Error("caller cancelled during recovery wait")
+      const controller = new AbortController()
+      let cancelCalls = 0
+      const rejections: unknown[] = []
+      const onUnhandled = (reason: unknown) => {
+        rejections.push(reason)
+      }
+      process.on("unhandledRejection", onUnhandled)
+      const retained = mockRes(401, "primary-auth-failure")
+      retained.body!.cancel = () => {
+        cancelCalls++
+        return new Promise(() => {})
+      }
+      let waitStarted!: () => void
+      const waitReady = new Promise<void>((resolve) => {
+        waitStarted = resolve
+      })
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return requestHeaders(input, init).get("Authorization") === "Bearer key-a"
+          ? retained
+          : mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: (_level, msg) => {
+          if (msg === "credential rotation") state.blocked.add(1)
+        },
+        now: () => 1_000,
+        wait: async (_delayMs, signal) => {
+          waitStarted()
+          return new Promise<void>((_resolve, reject) => {
+            const onAbort = () => {
+              signal.removeEventListener("abort", onAbort)
+              reject(signal.reason)
+            }
+            signal.addEventListener("abort", onAbort)
+            if (signal.aborted) onAbort()
+          })
+        },
+      })
+      state.cooldownUntil.set(2, 61_000)
+
+      try {
+        const pending = fetch("https://api.example.com/abort-recovery-wait", { signal: controller.signal })
+        await waitReady
+        controller.abort(abort)
+        await expect(pending).rejects.toBe(abort)
+        expect(upstreamAuth).toEqual(["Bearer key-a"])
+        expect(cancelCalls).toBe(1)
+        expect(retained.body?.locked).toBe(false)
+        expect(getEventListeners(controller.signal, "abort")).toHaveLength(0)
+        await Promise.resolve()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(rejections).toEqual([])
+        expect(state.activeIndex).toBe(0)
+        expect(state.blocked.has(0)).toBe(true)
+        expect(state.blocked.has(1)).toBe(true)
+        expect(state.cooldownUntil.get(2)).toBe(61_000)
+      } finally {
+        process.off("unhandledRejection", onUnhandled)
+      }
+    })
+
+    for (const testCase of [
+      {
+        name: "ordinary",
+        error: new TypeError("ordinary transport"),
+        setup(state: { activeIndex: number; blocked: Set<number>; cooldownUntil: Map<number, number> }) {
+          state.activeIndex = 0
+        },
+      },
+      {
+        name: "advisory",
+        error: new TypeError("advisory transport"),
+        setup(state: { activeIndex: number; blocked: Set<number>; cooldownUntil: Map<number, number> }) {
+          state.activeIndex = 1
+          state.cooldownUntil.set(0, 61_000)
+        },
+      },
+    ]) {
+      it(`preserves the original ${testCase.name} model transport error when concurrent invalidation leaves no response`, async () => {
+        const accounts = [
+          mk("key-primary", true, "primary", "primary"),
+          mk("key-overage", true, "overage", "overage_fallback"),
+        ]
+        const upstreamAuth: string[] = []
+        const { fetch, state } = createRotatingFetch(accounts, -1, async (input, init) => {
+          if (isUsageRequest(input)) return usageResponse()
+          const authorization = requestHeaders(input, init).get("Authorization")!
+          upstreamAuth.push(authorization)
+          if (authorization === "Bearer key-primary") {
+            state.blocked.add(0)
+            state.blocked.add(1)
+            throw testCase.error
+          }
+          return mockRes(200)
+        }, {
+          logger: quietLogger,
+          now: () => 1_000,
+        })
+        testCase.setup(state)
+
+        await expect(fetch("https://api.example.com/transport-no-response")).rejects.toBe(testCase.error)
+        expect(upstreamAuth).toEqual(["Bearer key-primary"])
+        expect(state.blocked).toEqual(new Set([0, 1]))
+      })
+    }
+
+    it("removes the caller abort listener after usage lookup settles", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      const baseFetch = async (input: RequestInfo | URL) => {
+        if (isUsageRequest(input)) return usageResponse()
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      const controller = new AbortController()
+      expect((await fetch("https://api.example.com/abort-cleanup", { signal: controller.signal })).status).toBe(200)
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0)
+    })
+
+    it("warns once per account when useBalance is enabled", async () => {
+      const accounts = [
+        mk("secret-primary-key", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      const warnings: Array<{ msg: string; data?: Record<string, unknown> }> = []
+      const baseFetch = async (input: RequestInfo | URL) => {
+        if (isUsageRequest(input)) return usageResponse(usageBody({ useBalance: true, rollingUsage: usageWindow("rate-limited") }))
+        return mockRes(200)
+      }
+
+      let now = 1_000
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: (level, msg, data) => {
+          if (level === "warn") warnings.push({ msg, data })
+        },
+        now: () => now,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      expect((await fetch("https://api.example.com/balance-1")).status).toBe(200)
+      now = 6_001
+      expect((await fetch("https://api.example.com/balance-2")).status).toBe(200)
+      const balanceWarnings = warnings.filter(({ msg }) => /use balance/i.test(msg))
+      expect(balanceWarnings).toHaveLength(1)
+      expect(JSON.stringify(balanceWarnings)).not.toContain("secret-primary-key")
+    })
   })
 })
