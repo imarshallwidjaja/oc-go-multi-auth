@@ -356,7 +356,7 @@ describe("createRotatingFetch", () => {
 
       await expect(fetch("https://api.example.com")).rejects.toBe(stopped)
       expect(waitMs).toBe(60_000)
-      expect(state.cooldownUntil.get(0)).toBe(now + 60_000)
+    expect(state.cooldownUntil.get(0)).toBe(now + 60_000)
     }
   })
 

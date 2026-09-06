@@ -1,6 +1,7 @@
 import { log } from "./logger"
 import { selectAccount } from "./rotate"
 import type { GoAccount } from "./types"
+import { createHandoff, saveHandoff, type Handoff, type Message } from "./handoff"
 
 export interface RotatingFetchState {
   activeIndex: number
@@ -38,7 +39,9 @@ type ResponseClassification =
 interface RotatingFetchOptions {
   logger?: Logger
   onStickyChange?: (account: GoAccount) => void
+  onRateLimit?: (accountIndex: number, sessionId: string) => Promise<void>
   inspectionTimeoutMs?: number
+  cooldownMs?: number
   now?: () => number
   wait?: WaitFn
 }
@@ -526,7 +529,28 @@ export function createRotatingFetch(
           state.blocked.add(current.index)
           state.cooldownUntil.delete(current.index)
         } else {
-          state.cooldownUntil.set(current.index, classification.cooldownUntil)
+          // Use configurable cooldown if provided, otherwise use classification's cooldown
+          const effectiveCooldownMs = options.cooldownMs ?? classification.cooldownMs
+          const effectiveCooldownUntil = now() + effectiveCooldownMs
+          state.cooldownUntil.set(current.index, effectiveCooldownUntil)
+
+          // Trigger handoff on 429 rate limit
+          if (response.status === 429 && options.onRateLimit) {
+            logger("info", "rate limit detected, creating handoff", {
+              label: labelFor(accounts, current.index),
+              index: current.index,
+              status: response.status,
+              cooldownUntil: effectiveCooldownUntil,
+            })
+
+            try {
+              await options.onRateLimit(current.index, `session-${current.index}-${Date.now()}`)
+            } catch (error) {
+              logger("error", "handoff creation failed", {
+                error: error instanceof Error ? error.message : String(error),
+              })
+            }
+          }
         }
       }
 

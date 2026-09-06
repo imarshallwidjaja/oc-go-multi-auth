@@ -1,11 +1,11 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "name": "oc-go-multi-auth",
-  "version": "0.1.2",
-  "description": "Multi-account API key rotation for OpenCode Go subscription",
+  "name": "opencode-go-session-manager",
+  "version": "0.1.0",
+  "description": "Auto-handoff plugin for OpenCode Go with LanguageTool and Caveman compression",
   "type": "module",
   "bin": {
-    "oc-go-multi-auth": "./dist/cli.js"
+    "opencode-go-session-manager": "./dist/cli.js"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -28,19 +28,21 @@
   },
   "keywords": [
     "opencode",
-    "multi-account",
-    "auth",
+    "session-manager",
+    "handoff",
+    "languagetool",
+    "caveman",
     "plugin"
   ],
   "license": "MIT",
   "author": "imarshallwidjaja",
   "repository": {
     "type": "git",
-    "url": "https://github.com/imarshallwidjaja/oc-go-multi-auth"
+    "url": "https://github.com/BaconDroid/opencode-go-session-manager"
   },
-  "homepage": "https://github.com/imarshallwidjaja/oc-go-multi-auth",
+  "homepage": "https://github.com/BaconDroid/opencode-go-session-manager",
   "bugs": {
-    "url": "https://github.com/imarshallwidjaja/oc-go-multi-auth/issues"
+    "url": "https://github.com/BaconDroid/opencode-go-session-manager/issues"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
@@ -49,6 +51,7 @@
     "@opencode-ai/plugin": "^1.3.2",
     "@types/bun": "^1.3.13",
     "@types/node": "^25.6.0",
+    "bun-types": "^1.4.2",
     "typescript": "^5.8.0"
   },
   "dependencies": {

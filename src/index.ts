@@ -4,6 +4,7 @@ import { selectAccount, hasAccounts } from "./rotate"
 import { createRotatingFetch } from "./fetch"
 import { log } from "./logger"
 import { parseAccountRole, type AccountRole } from "./types"
+import { createHandoff, saveHandoff, type Message } from "./handoff"
 
 function parseOptionalRole(value: unknown): AccountRole | null {
   if (value == null) return "primary"
@@ -37,6 +38,7 @@ const plugin: Plugin = async ({ client }) => {
         })
 
         const { fetch } = createRotatingFetch(data.accounts, state.lastUsedIndex, undefined, {
+          cooldownMs: 5 * 60 * 60 * 1000,  // 5 hours for OpenCode Go
           onStickyChange(account) {
             const current = loadAccounts()
             const currentIndex = current.accounts.findIndex(
@@ -49,6 +51,52 @@ const plugin: Plugin = async ({ client }) => {
             current.rotationIndex = currentIndex
             saveAccounts(current)
             saveRotationState({ lastUsedIndex: currentIndex })
+          },
+          async onRateLimit(accountIndex: number, sessionId: string) {
+            log("info", "creating handoff for rate limit", {
+              accountIndex,
+              sessionId,
+            })
+
+            // Get recent messages and modified files from the client
+            // Note: In a real implementation, these would come from the OpenCode client
+            const recentMessages: Message[] = []
+            const modifiedFiles: string[] = []
+
+            // Get compaction summary from opencode-live-compaction
+            const compactionSummary = "Session context preserved through auto-handoff"
+
+            try {
+              const handoff = await createHandoff(
+                compactionSummary,
+                recentMessages,
+                modifiedFiles,
+                accountIndex,
+                sessionId,
+                {
+                  languagetoolUrl: "http://192.168.1.69:8010",
+                  cavemanUrl: "http://192.168.1.69:3000",
+                },
+              )
+
+              saveHandoff(handoff)
+
+              log("info", "handoff created successfully", {
+                id: handoff.id,
+                path: handoff.path,
+                language: handoff.language,
+                compressedSize: handoff.metadata.compressedSize,
+                originalSize: handoff.metadata.originalSize,
+              })
+
+              // TODO: Trigger new session with next account
+              // This would involve calling OpenCode's API to create a new session
+              // and execute /handoff resume <path>
+            } catch (error) {
+              log("error", "handoff creation failed", {
+                error: error instanceof Error ? error.message : String(error),
+              })
+            }
           },
         })
 
