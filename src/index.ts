@@ -202,6 +202,88 @@ const plugin: Plugin = async ({ client }) => {
             return { type: "success", key: data.accounts[stickyIndex].apiKey }
           },
         },
+        {
+          type: "api",
+          label: "Force Handoff",
+          prompts: [
+            {
+              type: "text",
+              key: "message",
+              message: "Reason for handoff (optional)",
+            },
+            {
+              type: "text",
+              key: "account",
+              message: "Switch to specific account number (1-based, optional)",
+            },
+          ],
+          async authorize(inputs) {
+            const data = loadAccounts()
+            const state = loadRotationState()
+
+            if (!hasAccounts(data.accounts)) {
+              log("warn", "force handoff failed", { reason: "no enabled accounts" })
+              return { type: "failed" }
+            }
+
+            const currentIndex = data.rotationIndex
+            const message = inputs?.message?.trim() || "Manual handoff triggered"
+
+            // Create handoff
+            const recentMessages = [
+              { role: "user" as const, content: message },
+              { role: "assistant" as const, content: "Handoff created manually" },
+            ]
+
+            try {
+              const handoff = await createHandoff(
+                message,
+                recentMessages,
+                [],
+                currentIndex,
+                `manual-${Date.now()}`,
+              )
+
+              saveHandoff(handoff)
+
+              // Determine next account
+              let nextIndex: number
+              if (inputs?.account) {
+                nextIndex = Number.parseInt(inputs.account, 10) - 1
+                if (nextIndex < 0 || nextIndex >= data.accounts.length || !data.accounts[nextIndex].enabled) {
+                  return { type: "failed" }
+                }
+              } else {
+                nextIndex = (currentIndex + 1) % data.accounts.length
+                while (nextIndex !== currentIndex && !data.accounts[nextIndex].enabled) {
+                  nextIndex = (nextIndex + 1) % data.accounts.length
+                }
+                if (nextIndex === currentIndex) {
+                  return { type: "failed" }
+                }
+              }
+
+              // Update rotation
+              data.rotationIndex = nextIndex
+              saveAccounts(data)
+              saveRotationState({ lastUsedIndex: nextIndex })
+
+              const nextAccount = data.accounts[nextIndex]
+              log("info", "force handoff", {
+                fromIndex: currentIndex,
+                toIndex: nextIndex,
+                handoffId: handoff.id,
+              })
+
+              return { type: "success", key: nextAccount.apiKey }
+            } catch (error) {
+              log("error", "force handoff failed", {
+                error: error instanceof Error ? error.message : String(error),
+              })
+              return { type: "failed" }
+            }
+          },
+        },
       ],
     },
   }

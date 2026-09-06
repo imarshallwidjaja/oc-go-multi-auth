@@ -1,13 +1,14 @@
 #!/usr/bin/env bun
 import { Command } from "commander"
-import { loadAccounts, saveAccounts, loadRotationState } from "./storage"
+import { loadAccounts, saveAccounts, loadRotationState, saveRotationState } from "./storage"
 import { hasAccounts } from "./rotate"
 import { log } from "./logger"
 import { parseAccountRole } from "./types"
+import { createHandoff, saveHandoff, listHandoffs, type Message } from "./handoff"
 
 const program = new Command()
 
-program.name("oc-go-multi-auth").description("Manage OpenCode Go multi-account auth").version("0.1.0")
+program.name("opencode-go-session-manager").description("Manage OpenCode Go session manager").version("0.1.0")
 
 program
   .command("list")
@@ -127,6 +128,115 @@ program
       overages,
       rotationIndex: data.rotationIndex,
     })
+  })
+
+program
+  .command("force-handoff")
+  .description("Force a handoff and switch to next account")
+  .option("-m, --message <message>", "Custom message for the handoff", "Manual handoff triggered")
+  .option("-a, --account <number>", "Switch to specific account number (1-based)")
+  .action(async (opts) => {
+    const data = loadAccounts()
+    const state = loadRotationState()
+
+    if (!hasAccounts(data.accounts)) {
+      console.error("Error: No enabled accounts configured")
+      process.exit(1)
+    }
+
+    const currentIndex = data.rotationIndex
+    const currentAccount = data.accounts[currentIndex]
+    const label = currentAccount.label || `Account ${currentIndex + 1}`
+
+    console.log(`Forcing handoff for ${label}...`)
+
+    // Create a handoff with the custom message
+    const recentMessages: Message[] = [
+      { role: "user", content: opts.message },
+      { role: "assistant", content: "Handoff created manually via CLI" },
+    ]
+
+    try {
+      const handoff = await createHandoff(
+        opts.message,
+        recentMessages,
+        [], // no modified files
+        currentIndex,
+        `manual-${Date.now()}`,
+      )
+
+      saveHandoff(handoff)
+
+      console.log(`Handoff created: ${handoff.id}`)
+      console.log(`Path: ${handoff.path}`)
+      console.log(`Language: ${handoff.language}`)
+
+      // Determine next account
+      let nextIndex: number
+      if (opts.account) {
+        nextIndex = Number.parseInt(opts.account, 10) - 1
+        if (nextIndex < 0 || nextIndex >= data.accounts.length) {
+          console.error(`Error: invalid account number "${opts.account}". Choose 1-${data.accounts.length}`)
+          process.exit(1)
+        }
+        if (!data.accounts[nextIndex].enabled) {
+          console.error(`Error: account ${opts.account} is disabled`)
+          process.exit(1)
+        }
+      } else {
+        // Find next available account
+        nextIndex = (currentIndex + 1) % data.accounts.length
+        while (nextIndex !== currentIndex && !data.accounts[nextIndex].enabled) {
+          nextIndex = (nextIndex + 1) % data.accounts.length
+        }
+        if (nextIndex === currentIndex) {
+          console.error("Error: No other enabled accounts available")
+          process.exit(1)
+        }
+      }
+
+      const nextAccount = data.accounts[nextIndex]
+      const nextLabel = nextAccount.label || `Account ${nextIndex + 1}`
+
+      // Update rotation
+      data.rotationIndex = nextIndex
+      saveAccounts(data)
+      saveRotationState({ lastUsedIndex: nextIndex })
+
+      console.log(`Switching to: ${nextLabel}`)
+      console.log(`\nTo resume, run: /handoff resume ${handoff.path}`)
+
+      log("info", "force-handoff", {
+        fromIndex: currentIndex,
+        toIndex: nextIndex,
+        handoffId: handoff.id,
+      })
+    } catch (error) {
+      console.error("Error creating handoff:", error instanceof Error ? error.message : error)
+      process.exit(1)
+    }
+  })
+
+program
+  .command("handoffs")
+  .description("List all handoffs")
+  .action(() => {
+    const handoffs = listHandoffs()
+    if (handoffs.length === 0) {
+      console.log("No handoffs found.")
+      return
+    }
+    console.log(`Found ${handoffs.length} handoff(s):\n`)
+    for (const handoff of handoffs) {
+      const date = new Date(handoff.timestamp).toISOString()
+      const account = handoff.metadata.accountIndex + 1
+      console.log(`  ${handoff.id}`)
+      console.log(`    Date: ${date}`)
+      console.log(`    Account: ${account}`)
+      console.log(`    Language: ${handoff.language}`)
+      console.log(`    Path: ${handoff.path}`)
+      console.log()
+    }
   })
 
 program.parse()
