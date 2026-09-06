@@ -32,6 +32,12 @@ export interface LanguageToolResult {
   matches: LanguageToolMatch[]
 }
 
+export interface LanguageToolConfig {
+  mode: "local" | "remote"
+  url?: string
+  localPort?: number
+}
+
 interface LanguageToolResponse {
   matches: LanguageToolMatch[]
   language: {
@@ -46,7 +52,6 @@ interface LanguageToolResponse {
 }
 
 function applyCorrections(text: string, matches: LanguageToolMatch[]): string {
-  // Sort matches by offset in descending order to avoid offset shifting
   const sortedMatches = [...matches].sort((a, b) => b.offset - a.offset)
 
   let correctedText = text
@@ -54,7 +59,6 @@ function applyCorrections(text: string, matches: LanguageToolMatch[]): string {
   for (const match of sortedMatches) {
     if (match.replacements.length === 0) continue
 
-    // Apply the first replacement
     const replacement = match.replacements[0].value
     const before = correctedText.slice(0, match.offset)
     const after = correctedText.slice(match.offset + match.length)
@@ -64,9 +68,61 @@ function applyCorrections(text: string, matches: LanguageToolMatch[]): string {
   return correctedText
 }
 
+async function checkLocal(text: string, port: number): Promise<LanguageToolResult> {
+  const response = await fetch(`http://localhost:${port}/v2/check`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      text,
+      language: "auto",
+    }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`LanguageTool API error: ${response.status} ${response.statusText}`)
+  }
+
+  const result = (await response.json()) as LanguageToolResponse
+  const correctedText = applyCorrections(text, result.matches)
+
+  return {
+    correctedText,
+    language: result.language.detectedLanguage.code,
+    matches: result.matches,
+  }
+}
+
+async function checkRemote(text: string, url: string): Promise<LanguageToolResult> {
+  const response = await fetch(`${url}/v2/check`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      text,
+      language: "auto",
+    }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`LanguageTool API error: ${response.status} ${response.statusText}`)
+  }
+
+  const result = (await response.json()) as LanguageToolResponse
+  const correctedText = applyCorrections(text, result.matches)
+
+  return {
+    correctedText,
+    language: result.language.detectedLanguage.code,
+    matches: result.matches,
+  }
+}
+
 export async function languageToolCheck(
   text: string,
-  url: string = "http://192.168.1.69:8010",
+  configOrUrl: string | LanguageToolConfig = { mode: "local", localPort: 8010 },
 ): Promise<LanguageToolResult> {
   if (!text || text.trim() === "") {
     return {
@@ -76,37 +132,34 @@ export async function languageToolCheck(
     }
   }
 
+  const config: LanguageToolConfig =
+    typeof configOrUrl === "string"
+      ? { mode: "remote", url: configOrUrl }
+      : configOrUrl
+
   log("info", "calling languagetool", {
-    url,
+    mode: config.mode,
+    url: config.url,
+    port: config.localPort,
     textLength: text.length,
   })
 
   try {
-    const response = await fetch(`${url}/v2/check`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: new URLSearchParams({
-        text,
-        // Auto-detect language
-        language: "auto",
-      }),
+    let result: LanguageToolResult
+
+    if (config.mode === "local") {
+      result = await checkLocal(text, config.localPort || 8010)
+    } else {
+      if (!config.url) throw new Error("LanguageTool URL required for remote mode")
+      result = await checkRemote(text, config.url)
+    }
+
+    log("info", "languagetool check completed", {
+      language: result.language,
+      corrections: result.matches.length,
     })
 
-    if (!response.ok) {
-      throw new Error(`LanguageTool API error: ${response.status} ${response.statusText}`)
-    }
-
-    const result = (await response.json()) as LanguageToolResponse
-
-    const correctedText = applyCorrections(text, result.matches)
-
-    return {
-      correctedText,
-      language: result.language.detectedLanguage.code,
-      matches: result.matches,
-    }
+    return result
   } catch (error) {
     log("error", "languagetool check failed", {
       error: error instanceof Error ? error.message : String(error),

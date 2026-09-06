@@ -74,8 +74,8 @@ const plugin: Plugin = async ({ client }) => {
                 accountIndex,
                 sessionId,
                 {
-                  languagetoolUrl: "http://192.168.1.69:8010",
-                  cavemanUrl: "http://192.168.1.69:3000",
+                  languagetool: { mode: "local", localPort: 8010 },
+                  caveman: { mode: "local" },
                 },
               )
 

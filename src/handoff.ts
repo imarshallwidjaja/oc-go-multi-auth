@@ -2,8 +2,8 @@ import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, unlink
 import { join } from "path"
 import { randomUUID } from "crypto"
 import { log } from "./logger"
-import { languageToolCheck } from "./languagetool"
-import { cavemanCompress } from "./caveman"
+import { languageToolCheck, type LanguageToolConfig } from "./languagetool"
+import { cavemanCompress, type CavemanConfig } from "./caveman"
 
 export interface Handoff {
   id: string
@@ -31,15 +31,15 @@ export interface Message {
 interface HandoffConfig {
   maxHandoffs: number
   handoffRetentionDays: number
-  languagetoolUrl: string
-  cavemanUrl: string
+  languagetool: LanguageToolConfig
+  caveman: CavemanConfig
 }
 
 const DEFAULT_CONFIG: HandoffConfig = {
   maxHandoffs: 10,
   handoffRetentionDays: 7,
-  languagetoolUrl: "http://192.168.1.69:8010",
-  cavemanUrl: "http://192.168.1.69:3000",
+  languagetool: { mode: "local", localPort: 8010 },
+  caveman: { mode: "local" },
 }
 
 function getHandoffDir(): string {
@@ -120,7 +120,7 @@ export async function createHandoff(
   let correctedText = naturalText
   let language = "en"
   try {
-    const ltResult = await languageToolCheck(naturalText, fullConfig.languagetoolUrl)
+    const ltResult = await languageToolCheck(naturalText, fullConfig.languagetool)
     correctedText = ltResult.correctedText
     language = ltResult.language
     log("info", "languagetool check completed", {
@@ -136,7 +136,7 @@ export async function createHandoff(
   // 3. Send to Caveman (MLM compression)
   let compressedText: string
   try {
-    compressedText = await cavemanCompress(correctedText, language, fullConfig.cavemanUrl)
+    compressedText = await cavemanCompress(correctedText, language, fullConfig.caveman)
     log("info", "caveman compression completed", {
       originalSize: correctedText.length,
       compressedSize: compressedText.length,

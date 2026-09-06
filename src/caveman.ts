@@ -7,38 +7,99 @@ export interface CavemanResponse {
   compressionRatio: number
 }
 
+export interface CavemanConfig {
+  mode: "local" | "remote"
+  url?: string
+  localCommand?: string
+}
+
+async function compressLocal(text: string, language: string): Promise<CavemanResponse> {
+  const { spawn } = await import("child_process")
+
+  return new Promise((resolve, reject) => {
+    const caveman = spawn("npx", ["-y", "@caveman-ai/cli", "compress"], {
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+
+    let stdout = ""
+    let stderr = ""
+
+    caveman.stdout.on("data", (data: Buffer) => {
+      stdout += data.toString()
+    })
+
+    caveman.stderr.on("data", (data: Buffer) => {
+      stderr += data.toString()
+    })
+
+    caveman.on("close", (code: number | null) => {
+      if (code !== 0) {
+        reject(new Error(`Caveman exited with code ${code}: ${stderr}`))
+        return
+      }
+
+      const lines = stdout.trim().split("\n")
+      const compressed = lines[0] || text
+
+      resolve({
+        compressed,
+        language,
+        model: "caveman-local",
+        compressionRatio: compressed.length / text.length,
+      })
+    })
+
+    caveman.stdin.write(text)
+    caveman.stdin.end()
+  })
+}
+
+async function compressRemote(text: string, language: string, url: string): Promise<CavemanResponse> {
+  const response = await fetch(`${url}/compress`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ text, language }),
+  })
+
+  if (!response.ok) {
+    throw new Error(`Caveman API error: ${response.status} ${response.statusText}`)
+  }
+
+  return (await response.json()) as CavemanResponse
+}
+
 export async function cavemanCompress(
   text: string,
   language: string = "en",
-  url: string = "http://192.168.1.69:3000",
+  configOrUrl: string | CavemanConfig = "http://localhost:3000",
 ): Promise<string> {
   if (!text || text.trim() === "") {
     return text
   }
 
+  const config: CavemanConfig =
+    typeof configOrUrl === "string"
+      ? { mode: configOrUrl.includes("localhost") || configOrUrl.includes("127.0.0.1") ? "local" : "remote", url: configOrUrl }
+      : configOrUrl
+
   log("info", "calling caveman", {
-    url,
+    mode: config.mode,
+    url: config.url,
     language,
     textLength: text.length,
   })
 
   try {
-    const response = await fetch(`${url}/compress`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        text,
-        language,
-      }),
-    })
+    let result: CavemanResponse
 
-    if (!response.ok) {
-      throw new Error(`Caveman API error: ${response.status} ${response.statusText}`)
+    if (config.mode === "local") {
+      result = await compressLocal(text, language)
+    } else {
+      if (!config.url) throw new Error("Caveman URL required for remote mode")
+      result = await compressRemote(text, language, config.url)
     }
-
-    const result = (await response.json()) as CavemanResponse
 
     log("info", "caveman compression successful", {
       model: result.model,
@@ -57,7 +118,6 @@ export async function cavemanCompress(
 }
 
 export function detectLanguage(text: string): string {
-  // Simple language detection based on common words
   const frenchWords = [
     "le", "la", "les", "de", "des", "du", "un", "une", "et", "est",
     "sont", "avoir", "être", "faire", "aller", "venir", "prendre",
@@ -80,11 +140,9 @@ export function detectLanguage(text: string): string {
     if (englishWords.includes(word)) englishCount++
   }
 
-  // If more French words detected, return French
   if (frenchCount > englishCount) {
     return "fr"
   }
 
-  // Default to English
   return "en"
 }
