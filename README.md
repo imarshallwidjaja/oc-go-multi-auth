@@ -4,6 +4,8 @@
 
 Run multiple OpenCode Go accounts side-by-side through OpenCode's `opencode-go` provider. The plugin keeps a working account sticky across the live process and fails over only when the provider reports a credential, quota, or entitlement problem.
 
+The package source contains separate OpenCode V1 and V2 adapters. OpenCode V1 1.18.29+ calls the V1 `server()` implementation; OpenCode V2 2.0.2 through 2.0.x calls the V2 `id`/`setup()` implementation. They share account storage and rotation internals, but each adapter uses its own plugin API.
+
 ![License](https://img.shields.io/github/license/imarshallwidjaja/oc-go-multi-auth)
 ![GitHub last commit](https://img.shields.io/github/last-commit/imarshallwidjaja/oc-go-multi-auth)
 
@@ -21,16 +23,47 @@ Run multiple OpenCode Go accounts side-by-side through OpenCode's `opencode-go` 
 
 ---
 
-## Installation
+## Source Setup
+
+`oc-go-multi-auth` is not published to npm yet. Clone and build the current source for development and verification:
 
 ```sh
-opencode plugin github:imarshallwidjaja/oc-go-multi-auth --global
+git clone https://github.com/imarshallwidjaja/oc-go-multi-auth
+cd oc-go-multi-auth
+bun install
+bun run build
 ```
 
-This installs the plugin globally so every OpenCode session uses it.
+You can run the account CLI from the checkout with `bun run src/cli.ts`. Do not use a raw Git package specifier as a V2 installation shortcut: OpenCode V2 installs packages with lifecycle scripts disabled, so the Git install does not run this package's `prepack` build.
+
+## Registry Installation
+
+After the package is published, install it globally:
+
+```sh
+bun add --global oc-go-multi-auth
+```
+
+Add the registry package name to your OpenCode configuration. V1 uses the singular `plugin` key:
+
+```json
+{
+  "plugin": ["oc-go-multi-auth"]
+}
+```
+
+V2 uses the plural `plugins` key:
+
+```json
+{
+  "plugins": ["oc-go-multi-auth"]
+}
+```
+
+The global package install exposes the `oc-go-multi-auth` account-management CLI. OpenCode resolves the same registry package for the configured plugin. Restart OpenCode after installing or updating it.
 
 **Prerequisites:**
-- [OpenCode](https://opencode.ai) 1.x (Go subscription)
+- [OpenCode](https://opencode.ai) 1.18.29 through 1.x, or 2.0.2 through 2.0.x (V2.0.0, V2.0.1, and V2.1+ are not supported)
 - [Bun](https://bun.sh) 1.x (for local development)
 - One or more Go API keys from [opencode.ai/auth](https://opencode.ai/auth)
 
@@ -44,25 +77,33 @@ Open [opencode.ai/auth](https://opencode.ai/auth) in your browser and generate o
 
 ### 2. Add an account to the plugin
 
-In OpenCode, open the auth settings and run the **Add Go Account** method:
+On OpenCode V1 1.18.29+, open the auth settings and run the **Add Go Account** method:
 
-```
-OpenCode Settings → Auth → Add Go Account
+```text
+OpenCode Settings -> Auth -> Add Go Account
 ```
 
-Paste your Go API key when prompted. Optionally give it a label (e.g. "Work", "Personal", "Account 2") and a role (`primary` by default, or `overage_fallback` for a paid-overage safety net).
+On OpenCode V2, add the account with the CLI after a registry install:
+
+```sh
+oc-go-multi-auth add --key <key> --label "Work"
+```
+
+From a source checkout, run `bun run src/cli.ts add --key <key> --label "Work"` instead.
+
+Optionally give the account a label and a role (`primary` by default, or `overage_fallback` for a paid-overage safety net).
 
 Repeat for each Go subscription you own. Tag the overage-enabled account with `oc-go-multi-auth set-role <n> overage_fallback` so the plugin leaves it as soon as another account is available again.
 
 ### 3. Start using OpenCode
 
-That's it. The plugin automatically picks an account on every session start and signs all `opencode-go` provider requests with its API key. OpenCode will show `opencode-go` as the active auth provider.
+That's it. The plugin picks an account when it loads and signs all `opencode-go` provider requests with its API key. OpenCode will show `opencode-go` as the active auth provider.
 
 ---
 
 ## Account Management
 
-OpenCode exposes auth methods for this plugin:
+OpenCode V1 exposes auth methods for this plugin:
 
 | Type | Label | Purpose |
 |---|---|---|
@@ -79,7 +120,7 @@ Use the CLI for account management and status:
 | `oc-go-multi-auth remove <number>` | Remove an account by its 1-based list number |
 | `oc-go-multi-auth status` | Show account counts by role and persisted rotation state |
 
-Run **Add Go Account** from OpenCode's auth settings so the first key also primes the `opencode-go` auth store.
+On V1, run **Add Go Account** from OpenCode's auth settings so the first key also primes the `opencode-go` auth store. On V2, use the CLI and restart OpenCode after adding the first account. V2 setup leaves the catalog unchanged when no account is enabled. On restart, it redirects supported OpenAI-compatible, OpenAI, and Anthropic catalog packages to the bundled native transport and seeds an integration connection when none exists.
 
 ---
 
@@ -112,8 +153,8 @@ Both files use `0o600` permissions. The accounts file is written atomically (tmp
 git clone https://github.com/imarshallwidjaja/oc-go-multi-auth
 cd oc-go-multi-auth
 bun install
-bun test       # tests across 4 modules
-bun run build  # bundles to dist/index.js
+bun test       # tests across 7 modules
+bun run build  # builds declarations and the V1/V2 package entrypoints
 bun run typecheck  # tsc --noEmit
 ```
 

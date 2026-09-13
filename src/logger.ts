@@ -1,19 +1,18 @@
 import { appendFileSync, mkdirSync } from "fs"
 import { join } from "path"
 
-const dir = join(process.env.HOME ?? "/root", ".config", "opencode")
-const file = join(dir, "oc-go-multi-auth.log")
+const started = new Set<string>()
 
-let started = false
-
-function ensure() {
-  if (started) return
+function ensure(dir: string) {
+  if (started.has(dir)) return
   mkdirSync(dir, { recursive: true })
-  started = true
+  started.add(dir)
 }
 
 export function log(level: "info" | "warn" | "error", msg: string, data?: Record<string, unknown>) {
-  ensure()
+  const dir = join(process.env.HOME ?? "/root", ".config", "opencode")
+  const file = join(dir, "oc-go-multi-auth.log")
+  ensure(dir)
   const entry = JSON.stringify({
     ts: new Date().toISOString(),
     level,

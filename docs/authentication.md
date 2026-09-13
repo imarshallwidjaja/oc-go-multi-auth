@@ -26,7 +26,7 @@ Each key is tied to a specific Go subscription and its associated quota.
 
 ## Adding an Account
 
-### Via OpenCode Auth Settings
+### Via OpenCode V1 Auth Settings
 
 1. Open OpenCode.
 2. Go to **Settings → Auth** (or open the command palette and type "Auth").
@@ -36,7 +36,15 @@ Each key is tied to a specific Go subscription and its associated quota.
 6. Optionally enter a label (e.g. "Work", "Personal") to identify the account later.
 7. Confirm — you'll see a success response.
 
-### What Happens Behind the Scenes
+### Via CLI on V1 or V2
+
+```sh
+oc-go-multi-auth add --key <key> --label "Work" --role primary
+```
+
+Restart OpenCode after adding an account. V2 runs plugin setup at startup, registers the `opencode-go` key method, and seeds an integration connection when one does not already exist.
+
+### What Happens Behind the Scenes on V1
 
 When you submit the API key:
 
@@ -46,11 +54,11 @@ When you submit the API key:
 4. It writes the updated accounts file atomically (tmp file + rename).
 5. It **immediately syncs** the new key to OpenCode's internal auth store via `authClient.auth.set()` — this is critical because OpenCode only activates the plugin's `loader()` when the auth store has a value for the `"opencode-go"` provider.
 
-> **Important:** The first account you add is special — it "primes" OpenCode's auth store so the plugin's loader actually fires on subsequent sessions. If you remove all accounts, the loader stops running until you add one again.
+> **Important:** The first account you add is special: it primes OpenCode's auth store so the plugin's loader can run on subsequent sessions. If you remove all accounts, the loader stops running until you add one again.
 
 ---
 
-## The Auth Provider Flow
+## The V1 Auth Provider Flow
 
 OpenCode's plugin system uses this lifecycle:
 
@@ -81,24 +89,17 @@ OpenCode uses returned fetch for all API calls
 
 ### The Auth Store Gate
 
-This is the single most important detail of the plugin: **the loader function only runs when OpenCode's auth store has a value for the `"opencode-go"` provider**. `opencode` and `opencode-go` are separate provider endpoints, so the hook and stored auth ID must match `opencode-go` exactly.
+On V1, the loader function only runs when OpenCode's auth store has a value for the `"opencode-go"` provider. `opencode` and `opencode-go` are separate provider endpoints, so the hook and stored auth ID must match `opencode-go` exactly.
 
-The code looks like:
+That's why `Add Go Account` calls the V1 SDK's `authClient.auth.set()` endpoint: it ensures the provider has stored credentials. The `loader()` calls the same endpoint with the selected account's key, keeping the provider active for the next session. Both calls inspect the SDK result and fail explicitly when OpenCode rejects the write.
 
-```ts
-// Inside OpenCode's provider.ts (simplified)
-for (const hook of authHooks) {
-  const auth = await authClient.auth.get({ path: { id: "opencode-go" } })
-  if (!auth) continue  // ← skips the plugin entirely
-  // ... calls plugin loader()
-}
-```
+## The V2 Setup Flow
 
-That's why `Add Go Account` calls `authClient.auth.set()` — it ensures the gate stays open. The `loader()` then calls `auth.set()` again with the **selected** account's key, keeping the gate open for the next session.
+V2 calls the plugin's `setup()` entrypoint directly. Setup always registers an `opencode-go` key method. When an account is enabled, it uses `ctx.catalog.transform` to replace supported OpenAI-compatible, OpenAI, and Anthropic provider/model packages with the package's V2 native entrypoint. The transform applies OpenCode 2.0.2's AI SDK-to-native settings normalization and records each original package. Unsupported packages stay with the host. If no account is enabled, setup leaves the catalog unchanged; add an account with the CLI and restart OpenCode. Repeated setup on the same context replaces the prior registrations instead of stacking them. V2 does not call the V1 `server()` entrypoint or expose the V1 auth methods.
 
 ---
 
-## How OpenCode Gets the API Key
+## How OpenCode Gets the API Key on V1
 
 The `loader()` returns:
 
@@ -115,18 +116,20 @@ OpenCode uses the returned `fetch` function as a drop-in replacement for `global
 
 The `apiKey` field is deliberately left empty because OpenCode uses the returned `fetch` rather than reading `apiKey` directly (at least for the Go provider).
 
+V2 adapts the same rotating fetch state machine to the host-supplied native HTTP handler. Every retry re-enters the supplied handler and middleware with a fresh request body. It replaces both supported protocol credential headers, then applies `Authorization: Bearer` for OpenAI-compatible/OpenAI or `x-api-key` for Anthropic. The advisory usage request always uses bearer authentication to `opencode.ai`. The native provider retains endpoint construction, request serialization, response framing, and stream parsing. Setup also seeds an enabled key as an `opencode-go` integration connection when needed. Rotation remains registered if this optional connection seed fails; the failure is written to the plugin log.
+
 ---
 
 ## Troubleshooting
 
 **"No Go accounts configured"**
-→ You haven't added any accounts yet. Run `Add Go Account` from the command palette.
+→ You haven't added any accounts yet. Use `oc-go-multi-auth add`, or run **Add Go Account** from OpenCode V1's auth settings.
 
 **OpenCode shows a different auth provider**
 → The plugin only activates for the `"opencode-go"` provider. If OpenCode is set to `opencode` or another provider, the plugin's loader won't run.
 
 **Auth method doesn't appear in the palette**
-→ Make sure the plugin is installed globally: `opencode plugin list` should show it.
+→ V2 does not expose the V1 auth methods; use the CLI. On V1, make sure the plugin is installed globally: `opencode plugin list` should show it.
 
 **Loader doesn't fire after adding first account**
-→ After adding your first account via `Add Go Account`, the key is synced to the auth store. Restart OpenCode (quit and reopen) for the loader to activate on the new session.
+→ This applies to V1. Add the first account through **Add Go Account** so the key is synced to the auth store, then restart OpenCode. On V2, add the account with the CLI and restart so `setup()` can connect it.

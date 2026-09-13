@@ -1,6 +1,7 @@
-import { log } from "./logger"
-import { selectAccount } from "./rotate"
-import type { GoAccount } from "./types"
+import { log } from "./logger.js"
+import { USAGE_URL } from "./opencode.js"
+import { selectAccount } from "./rotate.js"
+import type { GoAccount } from "./types.js"
 
 export interface RotatingFetchState {
   activeIndex: number
@@ -8,7 +9,7 @@ export interface RotatingFetchState {
   cooldownUntil: Map<number, number>
 }
 
-type FetchFn = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+export type FetchFn = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 type Candidate = { account: GoAccount; index: number }
 type Logger = typeof log
 type WaitFn = (delayMs: number, signal: AbortSignal) => Promise<void>
@@ -51,7 +52,6 @@ const USAGE_LOOKUP_TIMEOUT_MS = 750
 const USAGE_CACHE_TTL_MS = 5_000
 const DEFAULT_COOLDOWN_MS = 60_000
 const MAX_COOLDOWN_MS = 10 * 60_000
-const USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
 const HTTP_DATE_PATTERN = /^(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} \d{2}:\d{2}:\d{2} GMT|(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \d{2}-(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)-\d{2} \d{2}:\d{2}:\d{2} GMT|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \d]\d \d{2}:\d{2}:\d{2} \d{4})$/
 
 const discriminatorReasons = new Map<string, RotationReason>([
@@ -860,7 +860,7 @@ export function createRotatingFetch(
           response,
           inspectionTimeoutMs,
           now,
-          advisory ? template.signal : undefined,
+          template.signal,
         )
       } catch (error) {
         discardResponse(response)

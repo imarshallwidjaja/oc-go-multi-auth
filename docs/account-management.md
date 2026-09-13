@@ -1,19 +1,19 @@
 # Account Management
 
-Add Go accounts from OpenCode's auth settings. List, remove, and inspect stored accounts with the `oc-go-multi-auth` CLI.
+On OpenCode V1, add Go accounts from the auth settings. On V1 or V2, manage stored accounts with the `oc-go-multi-auth` CLI.
 
 ---
 
 ## Overview
 
-The plugin provides auth methods in OpenCode:
+The plugin provides these auth methods in OpenCode V1 1.18.29+:
 
 | Method | What it does |
 |---|---|
 | **Add Go Account** | Add a new Go API key to the pool |
 | **Set Go Account Role** | Change an existing account's preference role |
 
-Account management and status are CLI commands:
+These account-management and status commands work with V1 and V2:
 
 | Command | What it does |
 |---|---|
@@ -27,7 +27,7 @@ Account management and status are CLI commands:
 
 ## Adding an Account
 
-### Steps
+### OpenCode V1 Auth Settings
 
 1. Open OpenCode and go to **Settings → Auth**.
 2. Find the **Go Multi-Auth** provider and click **Add Go Account**.
@@ -35,6 +35,14 @@ Account management and status are CLI commands:
 4. Optionally enter a label (e.g., "Work account", "Personal").
 5. Optionally enter a role: `primary` (default) or `overage_fallback` for a paid-overage safety-net account.
 6. Confirm — you'll see a success message.
+
+### V1 or V2 CLI
+
+```sh
+oc-go-multi-auth add --key <key> --label "Work account" --role primary
+```
+
+Restart OpenCode after changing accounts or roles. The running process keeps the account pool it loaded at startup.
 
 ### Prompt Fields
 
@@ -48,7 +56,7 @@ Account management and status are CLI commands:
 
 - Adding an account does **not** switch the current OpenCode process's active account. The new account will be available on the next OpenCode restart.
 - Changing a role (CLI or **Set Go Account Role**) updates the on-disk pool immediately, but the live OpenCode process keeps the roles loaded at startup until restart — same as adding accounts.
-- The first account ever added primes the auth store (see [authentication.md](./authentication.md) for why this matters).
+- On V1, adding the first account through auth settings primes the auth store (see [authentication.md](./authentication.md) for why this matters). V2 always registers a key integration method. It redirects supported `opencode-go` catalog models and seeds a connection only when setup starts with an enabled account, so restart after adding the first account.
 - Duplicate API keys are not detected — you can add the same key twice (though you probably shouldn't).
 
 ---
@@ -88,7 +96,7 @@ Tag the account that has paid overages enabled:
 oc-go-multi-auth set-role 3 overage_fallback
 ```
 
-Or use **Settings → Auth → Set Go Account Role** and enter the list number plus `primary` or `overage_fallback`.
+On V1, you can instead use **Settings → Auth → Set Go Account Role** and enter the list number plus `primary` or `overage_fallback`.
 
 For the account count by role and raw persisted rotation values, run `oc-go-multi-auth status`.
 
@@ -145,10 +153,10 @@ Session 4: Account 1 (rotationIndex = 0) ← wraps around
 
 ### Adding Multiple Accounts
 
-```
-Settings → Auth → Add Go Account → paste key1 → label "Work"
-Settings → Auth → Add Go Account → paste key2 → label "Personal"
-Settings → Auth → Add Go Account → paste key3 → label "Backup"
+```sh
+oc-go-multi-auth add --key <key1> --label "Work"
+oc-go-multi-auth add --key <key2> --label "Personal"
+oc-go-multi-auth add --key <key3> --label "Backup"
 ```
 
 ### Checking Which Account Is Active
@@ -168,9 +176,8 @@ oc-go-multi-auth list
 oc-go-multi-auth remove 3
 ```
 
-Then use OpenCode to add the replacement:
+Then add the replacement:
 
-```
-Settings → Auth → Add Go Account
-→ paste new key → label "New Backup"
+```sh
+oc-go-multi-auth add --key <new-key> --label "New Backup"
 ```

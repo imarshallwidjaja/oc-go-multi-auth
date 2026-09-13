@@ -12,20 +12,24 @@ src/
 ├── storage.ts     # Atomic file I/O for accounts & rotation state
 ├── rotate.ts      # Round-robin account selection logic
 ├── fetch.ts       # Auth header injection + credential failover interceptor
-├── index.ts       # Plugin entry point (loader + Add Go Account method)
+├── runtime.ts     # Shared rotation initialization and sticky-state persistence
+├── index.ts       # V1 server and V2 catalog/integration setup entry point
+├── v2-provider.ts # V2 native provider transport adapter
 ├── cli.ts         # List, remove, and inspect stored accounts
 └── __tests__/     # automated tests
     ├── storage.test.ts
     ├── rotate.test.ts
     ├── fetch.test.ts
-    └── plugin.test.ts
+    ├── cli.test.ts
+    ├── plugin.test.ts
+    └── v2-provider.test.ts
 ```
 
 ---
 
 ## Data Flow
 
-### Session Start
+### Session Start on V1
 
 ```
 1. OpenCode starts
@@ -61,6 +65,14 @@ src/
 10. Return { apiKey, fetch } to OpenCode
 ```
 
+### Session Start on V2
+
+V2 calls `setup()` directly. Setup first registers an `opencode-go` key method through `ctx.integration.transform`. When an account is enabled, it registers `ctx.catalog.transform`, normalizes the three supported AI SDK packages using the OpenCode 2.0.2 mapping contract, records their original provider/model packages, and redirects them to `oc-go-multi-auth/v2/provider`. Unsupported provider and model packages are left unchanged. A model package takes precedence over its provider package.
+
+The V2 provider module delegates construction to the recorded native `@opencode/ai` provider and replaces only its HTTP middleware. OpenAI-compatible chat, OpenAI responses, and Anthropic messages overrides are preserved. The catalog transform never routes an unsupported package to this module.
+
+After rotation is registered, setup optionally seeds an integration connection from the first enabled stored account when no connection exists. Empty account storage skips both the catalog transform and connection write until the next restart. A connection-seeding failure is logged and leaves the catalog registration active. Repeated setup disposes the previous registrations before adding replacements.
+
 ### Request Flow
 
 ```
@@ -75,7 +87,7 @@ rotatingFetch(input, init)
          │           all-ok ──▶ one advisory primary attempt
          │           else ──▶ keep overage candidate (fail open)
          ├── headers.set("Authorization", "Bearer <activeKey>")
-         ├── await globalThis.fetch(input, headers)
+         ├── await underlying transport(input, headers)
          │
          ▼
     Response classification?
@@ -103,7 +115,7 @@ rotatingFetch(input, init)
 ### Account Management Flow
 
 ```
-User selects "Add Go Account"
+V1 user selects "Add Go Account"
          │
          ├── prompts: apiKey, label, role
          │
@@ -229,23 +241,30 @@ The interceptor accepts a `baseFetch` parameter for testability:
 const { fetch } = createRotatingFetch(accounts, lastIndex, mockFetch)
 ```
 
+### `runtime.ts` — Rotation Initialization
+
+Loads the account and sticky-state files, chooses the process's starting account, and constructs `createRotatingFetch`. A successful replacement is mapped back to the current on-disk account by API key and `addedAt` before the sticky index is persisted.
+
+### `v2-provider.ts` — Native V2 Transport
+
+Exports the V2 provider-package `model(modelID, settings)` contract. It removes the private original-package setting, calls the corresponding native `@opencode/ai` model constructor, and decorates the returned route transport. The decorator converts each host request to a replayable Web `Request`; each credential attempt is converted back to a native Effect HTTP request and passed through the host-supplied middleware and handler. It removes stale `Authorization` and `x-api-key` values before applying the current account with the native protocol's scheme. Responses cross the bridge as streams. The rotating fetch clones only bodies it must inspect and applies its existing byte and time limits, while the returned branch remains readable.
+
+The module is a separate package export. The root plugin entry does not import it, `@opencode/ai`, or Effect at runtime, so loading the V1 adapter does not initialize the V2 provider stack.
+
 ### `index.ts` — Plugin Entry
 
-The plugin is an async function matching OpenCode's `Plugin` type:
+The default export follows OpenCode's temporary shared-package shape:
 
 ```ts
-const plugin: Plugin = async ({ client }) => {
-  return {
-    auth: {
-      provider: "opencode-go",
-      loader: async (getAuth) => { /* ... */ },
-      methods: [ /* auth methods */ ],
-    },
-  }
-}
+const plugin = {
+  id: "oc-go-multi-auth",
+  setup: async (ctx) => { /* V2 integration and catalog setup */ },
+} satisfies Plugin.Plugin
+
+export default { ...plugin, server } // V1 1.18.29+ calls server()
 ```
 
-The `loader` and **Add Go Account** authorize function both use `authClient.auth.set()` to sync the current key to OpenCode's auth store. This is essential because OpenCode checks the auth store before calling the loader. Account listing, removal, and status are implemented separately in `cli.ts` and are not OpenCode auth methods.
+The adapters share only version-neutral account selection, persistence, and rotating-fetch construction. V1's `loader` and **Add Go Account** authorize function use `authClient.auth.set()` and return V1 auth hooks. V2 registers its key method through the integration editor and its package-local native transport through the catalog editor. Account listing, removal, and status are implemented separately in `cli.ts`.
 
 ---
 
@@ -290,23 +309,26 @@ Both files are created with `0o600` permissions (readable only by the owner) sin
 
 ## Plugin System Integration
 
-OpenCode loads plugins via the `@opencode-ai/plugin` package. The plugin exports a default function:
+The package default-exports one object with both runtime contracts:
 
 ```ts
-export default plugin
-// type: (input: PluginInput) => Promise<Hooks>
+export default {
+  id: "oc-go-multi-auth",
+  setup,  // OpenCode V2
+  server, // OpenCode V1 1.18.29+
+}
 ```
 
-The `PluginInput` provides:
-- `client` — OpenCode's internal client (accessed as `any` for `auth.set()` / `auth.get()`)
+V1 passes `PluginInput` to `server()`:
+- `client` — the typed OpenCode V1 SDK client used for `auth.set()`
 - `project`, `directory`, `worktree`, `serverUrl`, `experimental_workspace`, `$` — standard context
 
-The returned `Hooks.auth` object has:
+The returned V1 `Hooks.auth` object has:
 - `provider: "opencode-go"` — must match the target provider ID and stored auth ID
 - `loader(getAuth) -> { apiKey, fetch }` — called at session start
 - `methods: AuthMethod[]` — available to the user via command palette
 
-The single auth method uses `type: "api"` for credential-based auth (**Add Go Account**). The `oc-go-multi-auth` CLI manages existing account records outside OpenCode's auth-method interface.
+The V1 auth methods use `type: "api"` for credential-based actions. V2 calls `setup()` and does not expose those methods, so V2 account management uses the `oc-go-multi-auth` CLI. The shared default export only packages both implementations together; it does not translate hooks or client calls between APIs.
 
 ---
 
@@ -314,5 +336,5 @@ The single auth method uses `type: "api"` for credential-based auth (**Add Go Ac
 
 - **API keys are stored in plaintext** on disk (`~/.config/opencode/`). Only the owner can read them (`0o600`).
 - **Keys are held in memory** for the duration of the session.
-- **Independent network calls** are limited to the advisory `GET https://opencode.ai/zen/go/v1/usage` lookup at the first primary-to-overage crossing. That request uses the captured underlying fetch and is never routed back through the interceptor. All other traffic is OpenCode's existing `opencode-go` API calls, which the plugin intercepts and may safely replay.
-- **No external dependencies** other than `@opencode-ai/plugin` for type definitions.
+- **Independent network calls** are limited to the advisory `GET https://opencode.ai/zen/go/v1/usage` lookup at the first primary-to-overage crossing. That request uses the captured underlying transport without recursively entering rotation. On V2 it still passes through the host-supplied HTTP middleware and handler.
+- **Plugin API dependencies** use optional peers for the `@opencode-ai/plugin` V1 declarations and `@opencode/plugin` V2 declarations. The package-local V2 provider has direct runtime dependencies on the exact `@opencode/ai` 2.0.2 contract and its matching Effect release.

@@ -206,6 +206,41 @@ describe("createRotatingFetch", () => {
     expect(callCount).toBe(1)
   })
 
+  it("cancels ordinary stalled 429 inspection when the caller aborts", async () => {
+    const controller = new AbortController()
+    const abort = new DOMException("request aborted", "AbortError")
+    const cancelled = Promise.withResolvers<void>()
+    const responseReady = Promise.withResolvers<void>()
+    const stalled = new ReadableStream<Uint8Array>({
+      cancel() {
+        cancelled.resolve()
+      },
+    })
+    const { fetch } = createRotatingFetch([mk("key-a")], -1, async () => {
+      responseReady.resolve()
+      return new Response(stalled, {
+        status: 429,
+        headers: { "content-type": "text/plain" },
+      })
+    }, {
+      logger: quietLogger,
+      inspectionTimeoutMs: 5_000,
+    })
+
+    const pending = fetch("https://api.example.com/cancel-inspection", { signal: controller.signal })
+    await responseReady.promise
+    controller.abort(abort)
+
+    await expect(Promise.race([
+      pending,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("abort timed out")), 100)),
+    ])).rejects.toBe(abort)
+    await expect(Promise.race([
+      cancelled.promise,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("stream cancellation timed out")), 100)),
+    ])).resolves.toBeUndefined()
+  })
+
   it("returns an engine-overload 429 intact without rotating or penalizing the sticky account", async () => {
     const accounts = [mk("key-a"), mk("key-b")]
     const authHeaders: string[] = []

@@ -32,6 +32,14 @@ async function runCli(...args: string[]) {
 }
 
 describe("oc-go-multi-auth cli roles", () => {
+  it("reports the package version", async () => {
+    const packageJson = await Bun.file(join(import.meta.dir, "../../package.json")).json()
+    const result = await runCli("--version")
+
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout.trim()).toBe(packageJson.version)
+  })
+
   it("adds with --role and updates via set-role", async () => {
     expect((await runCli("add", "--key", "go_a", "--label", "alpha")).exitCode).toBe(0)
     expect((await runCli("add", "--key", "go_b", "--label", "beta", "--role", "overage_fallback")).exitCode).toBe(0)

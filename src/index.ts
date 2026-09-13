@@ -1,9 +1,82 @@
-import type { Plugin } from "@opencode-ai/plugin"
-import { loadAccounts, saveAccounts, loadRotationState, saveRotationState } from "./storage"
-import { selectAccount, hasAccounts } from "./rotate"
-import { createRotatingFetch } from "./fetch"
-import { log } from "./logger"
-import { parseAccountRole, type AccountRole } from "./types"
+import type { Plugin as V2Plugin } from "@opencode/plugin"
+import type { Hooks, Plugin as V1Plugin } from "@opencode-ai/plugin"
+import { loadAccounts, saveAccounts } from "./storage.js"
+import { log } from "./logger.js"
+import { NATIVE_PACKAGE_SETTING, V2_NATIVE_PACKAGE_IDS } from "./opencode.js"
+import { parseAccountRole, type AccountRole } from "./types.js"
+import { initializeRotation } from "./runtime.js"
+
+const PROVIDER_ID = "opencode-go"
+const V2_PROVIDER_PACKAGE = "oc-go-multi-auth/v2/provider"
+const V2_NATIVE_PACKAGES = new Set<string>(V2_NATIVE_PACKAGE_IDS)
+
+type CatalogPackage = {
+  package?: string
+  settings?: Record<string, unknown>
+  headers?: Record<string, string>
+  body?: Record<string, unknown>
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function mergeBody(
+  base: Readonly<Record<string, unknown>> | undefined,
+  overlay: Readonly<Record<string, unknown>> | undefined,
+): Record<string, unknown> | undefined {
+  if (base === undefined) return overlay && { ...overlay }
+  if (overlay === undefined) return { ...base }
+  return Object.fromEntries(Array.from(new Set([...Object.keys(base), ...Object.keys(overlay)]), (key) => {
+    const left = base[key]
+    const right = overlay[key]
+    if (right === undefined) return [key, left]
+    if (isRecord(left) && isRecord(right)) return [key, mergeBody(left, right)]
+    return [key, right]
+  }))
+}
+
+function mergeHeaders(
+  base: Readonly<Record<string, string>> | undefined,
+  overlay: Readonly<Record<string, string>> | undefined,
+) {
+  if (base === undefined) return overlay && { ...overlay }
+  if (overlay === undefined) return { ...base }
+  return Object.fromEntries(
+    [...Object.entries(base), ...Object.entries(overlay)]
+      .reduce((result, entry) => result.set(entry[0].toLowerCase(), entry), new Map<string, [string, string]>())
+      .values(),
+  )
+}
+
+function normalizeV2Package(entry: CatalogPackage, providerID: string, inheritedPackage?: string) {
+  const source = entry.package ?? inheritedPackage
+  if (source === V2_PROVIDER_PACKAGE) {
+    return V2_NATIVE_PACKAGES.has(String(entry.settings?.[NATIVE_PACKAGE_SETTING]))
+  }
+  if (!source || !V2_NATIVE_PACKAGES.has(source)) return false
+
+  // Mirrors the three relevant mappings in OpenCode 2.0.2 AISDKNative.map.
+  const settings = { ...entry.settings }
+  const legacyHeaders = isRecord(settings.headers)
+    && Object.values(settings.headers).every((value) => typeof value === "string")
+    ? settings.headers as Record<string, string>
+    : undefined
+  const extraBody = isRecord(settings.extraBody) ? settings.extraBody : undefined
+  if (settings.apiKey !== undefined && typeof settings.apiKey !== "string") delete settings.apiKey
+  if (settings.baseURL !== undefined && typeof settings.baseURL !== "string") delete settings.baseURL
+  delete settings.headers
+  delete settings.extraBody
+  delete settings.useCompletionUrls
+  if (source === "aisdk:@ai-sdk/openai-compatible") settings.provider = providerID
+  settings[NATIVE_PACKAGE_SETTING] = source
+
+  entry.settings = settings
+  entry.headers = mergeHeaders(legacyHeaders, entry.headers)
+  entry.body = mergeBody(extraBody, entry.body)
+  entry.package = V2_PROVIDER_PACKAGE
+  return true
+}
 
 function parseOptionalRole(value: unknown): AccountRole | null {
   if (value == null) return "primary"
@@ -11,58 +84,15 @@ function parseOptionalRole(value: unknown): AccountRole | null {
   return parseAccountRole(value)
 }
 
-const plugin: Plugin = async ({ client }) => {
-  const authClient = client as any
-
+function createV1Hooks(setAuth: (key: string) => Promise<void>): Hooks {
   return {
     auth: {
-      provider: "opencode-go",
-      async loader(getAuth) {
-        const data = loadAccounts()
-        const state = loadRotationState()
-
-        if (!hasAccounts(data.accounts)) {
-          log("warn", "loader skipped", { reason: "no enabled accounts" })
-          return {}
-        }
-
-        const { account, index } = selectAccount(data.accounts, state.lastUsedIndex)
-        data.rotationIndex = index
-        saveAccounts(data)
-        saveRotationState({ lastUsedIndex: index })
-
-        await authClient.auth.set({
-          path: { id: "opencode-go" },
-          body: { type: "api", key: account.apiKey },
-        })
-
-        const { fetch } = createRotatingFetch(data.accounts, state.lastUsedIndex, undefined, {
-          onStickyChange(account) {
-            const current = loadAccounts()
-            const currentIndex = current.accounts.findIndex(
-              (candidate) => candidate.apiKey === account.apiKey && candidate.addedAt === account.addedAt,
-            )
-            if (currentIndex === -1) {
-              log("warn", "sticky account persistence skipped", { reason: "account_removed" })
-              return
-            }
-            current.rotationIndex = currentIndex
-            saveAccounts(current)
-            saveRotationState({ lastUsedIndex: currentIndex })
-          },
-        })
-
-        log("info", "loader active", {
-          account: account.label || `account-${index}`,
-          role: account.role,
-          index,
-          total: data.accounts.length,
-        })
-
-        return {
-          apiKey: "",
-          fetch,
-        }
+      provider: PROVIDER_ID,
+      async loader() {
+        const options = initializeRotation()
+        if (!options) return {}
+        await setAuth(options.key)
+        return { apiKey: "", fetch: options.fetch }
       },
       methods: [
         {
@@ -97,10 +127,7 @@ const plugin: Plugin = async ({ client }) => {
             if (data.accounts.length === 1) data.rotationIndex = 0
             saveAccounts(data)
 
-            await authClient.auth.set({
-              path: { id: "opencode-go" },
-              body: { type: "api", key },
-            })
+            await setAuth(key)
 
             log("info", "account added via auth login", {
               label: label || `account-${data.accounts.length}`,
@@ -159,4 +186,93 @@ const plugin: Plugin = async ({ client }) => {
   }
 }
 
-export default plugin
+const server: V1Plugin = async ({ client }) => {
+  return createV1Hooks(async (key) => {
+    const result = await client.auth.set({
+      path: { id: PROVIDER_ID },
+      body: { type: "api", key },
+    })
+    if (result.error !== undefined) {
+      const detail = result.error instanceof Error ? result.error.message : JSON.stringify(result.error)
+      throw new Error(`Failed to set OpenCode Go authentication: ${detail}`)
+    }
+  })
+}
+
+const v2Setups = new WeakMap<object, () => Promise<void>>()
+
+const plugin = {
+  id: "oc-go-multi-auth",
+  async setup(ctx) {
+    await v2Setups.get(ctx)?.()
+
+    const integrationRegistration = await ctx.integration.transform((integration) => {
+      integration.update(PROVIDER_ID, (value) => {
+        value.name = "OpenCode Go"
+      })
+      integration.method.update({
+        integrationID: PROVIDER_ID,
+        method: { type: "key", label: "Go API key" },
+      })
+    })
+
+    const account = loadAccounts().accounts.find((candidate) => candidate.enabled)
+    if (!account) {
+      log("warn", "catalog rotation setup skipped", { reason: "no enabled accounts", action: "restart after adding an account" })
+      let active = true
+      const cleanup = async () => {
+        if (!active) return
+        active = false
+        if (v2Setups.get(ctx) === cleanup) v2Setups.delete(ctx)
+        await integrationRegistration.dispose()
+      }
+      v2Setups.set(ctx, cleanup)
+      return cleanup
+    }
+
+    const catalogRegistration = await ctx.catalog.transform((catalog) => {
+      const record = catalog.provider.get(PROVIDER_ID)
+      if (!record) return
+
+      const providerPackage = record.provider.package
+      const providerIdentity = String(record.provider.canonical ?? PROVIDER_ID)
+      let wrapped = normalizeV2Package(record.provider, providerIdentity)
+
+      for (const model of record.models.values()) {
+        wrapped = normalizeV2Package(model, providerIdentity, providerPackage) || wrapped
+      }
+      if (wrapped) {
+        record.provider.integrationID = PROVIDER_ID as unknown as NonNullable<typeof record.provider.integrationID>
+      }
+    })
+
+    let active = true
+    const cleanup = async () => {
+      if (!active) return
+      active = false
+      if (v2Setups.get(ctx) === cleanup) v2Setups.delete(ctx)
+      await Promise.all([catalogRegistration.dispose(), integrationRegistration.dispose()])
+    }
+    v2Setups.set(ctx, cleanup)
+
+    try {
+      const connection = await ctx.integration.connection.active(PROVIDER_ID)
+      if (!connection) {
+        await ctx.integration.connect.key({ integrationID: PROVIDER_ID, key: account.apiKey })
+      }
+    } catch (error) {
+      log("warn", "integration connection priming failed", {
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
+    return cleanup
+  },
+} satisfies V2Plugin.Plugin
+
+interface RootPlugin {
+  readonly id: string
+  readonly setup: (context: unknown) => Promise<() => Promise<void>>
+  readonly server: (input: unknown) => Promise<unknown>
+}
+
+export default { ...plugin, server } as RootPlugin

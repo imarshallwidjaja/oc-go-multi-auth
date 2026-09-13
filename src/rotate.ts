@@ -1,4 +1,4 @@
-import type { GoAccount } from "./types"
+import type { GoAccount } from "./types.js"
 
 export function nextIndex(last: number, total: number): number {
   return (last + 1) % total

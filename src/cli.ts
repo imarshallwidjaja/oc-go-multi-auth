@@ -1,13 +1,17 @@
 #!/usr/bin/env bun
 import { Command } from "commander"
-import { loadAccounts, saveAccounts, loadRotationState } from "./storage"
-import { hasAccounts } from "./rotate"
-import { log } from "./logger"
-import { parseAccountRole } from "./types"
+import { readFileSync } from "fs"
+import { loadAccounts, saveAccounts, loadRotationState } from "./storage.js"
+import { hasAccounts } from "./rotate.js"
+import { log } from "./logger.js"
+import { parseAccountRole } from "./types.js"
 
 const program = new Command()
+const packageVersion = (JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
+) as { version: string }).version
 
-program.name("oc-go-multi-auth").description("Manage OpenCode Go multi-account auth").version("0.1.0")
+program.name("oc-go-multi-auth").description("Manage OpenCode Go multi-account auth").version(packageVersion)
 
 program
   .command("list")
