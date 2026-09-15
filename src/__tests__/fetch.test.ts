@@ -20,6 +20,19 @@ function mockRes(status: number, body = "ok", headers?: HeadersInit) {
   return new Response(body, { status, headers })
 }
 
+function spyReadableStreamCancel() {
+  const original = ReadableStream.prototype.cancel
+  let calls = 0
+  ReadableStream.prototype.cancel = function (reason?: unknown) {
+    calls++
+    return original.call(this, reason)
+  }
+  return {
+    get calls() { return calls },
+    restore() { ReadableStream.prototype.cancel = original },
+  }
+}
+
 function requestHeaders(input: RequestInfo | URL, init?: RequestInit) {
   return new Headers(input instanceof Request ? input.headers : init?.headers)
 }
@@ -1548,17 +1561,24 @@ describe("createRotatingFetch", () => {
     return requestUrl(input) === USAGE_URL
   }
 
-  function usageWindow(status: "ok" | "rate-limited", usagePercent = 12, resetInSec = 90) {
-    return { status, usagePercent, resetInSec }
+  function usageWindow(status: "ok" | "rate-limited", percent = 12, resetsAt = "2026-08-13T16:27:38.287Z") {
+    return { status, percent, resetsAt }
   }
 
   function usageBody(overrides: Record<string, unknown> = {}) {
+    const usageOverride = overrides.usage && typeof overrides.usage === "object" && !Array.isArray(overrides.usage)
+      ? overrides.usage as Record<string, unknown>
+      : {}
+    const rest = { ...overrides }
+    delete rest.usage
     return {
-      useBalance: false,
-      rollingUsage: usageWindow("ok"),
-      weeklyUsage: usageWindow("ok"),
-      monthlyUsage: usageWindow("ok"),
-      ...overrides,
+      usage: {
+        rolling: usageWindow("ok"),
+        weekly: usageWindow("ok"),
+        monthly: usageWindow("ok"),
+        ...usageOverride,
+      },
+      ...rest,
     }
   }
 
@@ -1598,7 +1618,7 @@ describe("createRotatingFetch", () => {
         if (isUsageRequest(input)) {
           usageAuth.push(requestHeaders(input, init).get("Authorization")!)
           usageMethods.push(input instanceof Request ? input.method : init?.method ?? "GET")
-          return usageResponse(usageBody({ extra: "tolerated", rollingUsage: { ...usageWindow("ok"), extra: 1 } }))
+          return usageResponse(usageBody({ extra: "tolerated", usage: { rolling: { ...usageWindow("ok"), extra: 1 } } }))
         }
         upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
         return mockRes(200)
@@ -1619,7 +1639,31 @@ describe("createRotatingFetch", () => {
       expect(state.cooldownUntil.has(0)).toBe(false)
     })
 
-    for (const window of ["rollingUsage", "weeklyUsage", "monthlyUsage"] as const) {
+    it("recovers when useBalance is non-boolean and all usage windows are ok", async () => {
+      const accounts = [
+        mk("key-primary", true, "primary", "primary"),
+        mk("key-overage", true, "overage", "overage_fallback"),
+      ]
+      const upstreamAuth: string[] = []
+      const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (isUsageRequest(input)) return usageResponse(usageBody({ useBalance: "yes" }))
+        upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
+        return mockRes(200)
+      }
+
+      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+        logger: quietLogger,
+        now: () => 1_000,
+      })
+      state.activeIndex = 1
+      state.cooldownUntil.set(0, 61_000)
+
+      expect((await fetch("https://api.example.com/recover-use-balance")).status).toBe(200)
+      expect(upstreamAuth).toEqual(["Bearer key-primary"])
+      expect(state.activeIndex).toBe(0)
+    })
+
+    for (const window of ["rolling", "weekly", "monthly"] as const) {
       it(`keeps overage when ${window} is rate-limited`, async () => {
         const accounts = [
           mk("key-primary", true, "primary", "primary"),
@@ -1627,7 +1671,7 @@ describe("createRotatingFetch", () => {
         ]
         const upstreamAuth: string[] = []
         const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
-          if (isUsageRequest(input)) return usageResponse(usageBody({ [window]: usageWindow("rate-limited") }))
+          if (isUsageRequest(input)) return usageResponse(usageBody({ usage: { [window]: usageWindow("rate-limited") } }))
           upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
           return mockRes(200)
         }
@@ -1725,11 +1769,10 @@ describe("createRotatingFetch", () => {
       { name: "401", usage: async () => usageResponse("unauthorized", 401) },
       { name: "malformed JSON", usage: async () => usageResponse("not-json") },
       { name: "oversized content-length", usage: async () => usageResponse(usageBody(), 200, { "content-length": "999999" }) },
-      { name: "missing windows", usage: async () => usageResponse({ useBalance: false }) },
-      { name: "non-boolean useBalance", usage: async () => usageResponse(usageBody({ useBalance: "yes" })) },
-      { name: "invalid status", usage: async () => usageResponse(usageBody({ rollingUsage: usageWindow("OK" as "ok") })) },
-      { name: "usagePercent over 100", usage: async () => usageResponse(usageBody({ weeklyUsage: usageWindow("ok", 101) })) },
-      { name: "negative resetInSec", usage: async () => usageResponse(usageBody({ monthlyUsage: usageWindow("ok", 10, -1) })) },
+      { name: "missing windows", usage: async () => usageResponse({ usage: {} }) },
+      { name: "invalid status", usage: async () => usageResponse(usageBody({ usage: { rolling: usageWindow("OK" as "ok") } })) },
+      { name: "percent over 100", usage: async () => usageResponse(usageBody({ usage: { weekly: usageWindow("ok", 101) } })) },
+      { name: "invalid resetsAt", usage: async () => usageResponse(usageBody({ usage: { monthly: usageWindow("ok", 10, "not-a-date") } })) },
     ]) {
       it(`fails open to overage on ${testCase.name}`, async () => {
         const accounts = [
@@ -1924,7 +1967,7 @@ describe("createRotatingFetch", () => {
       const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
         if (isUsageRequest(input)) {
           usageCalls++
-          return usageResponse(usageBody({ rollingUsage: usageWindow("rate-limited") }))
+          return usageResponse(usageBody({ usage: { rolling: usageWindow("rate-limited") } }))
         }
         upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
         return mockRes(200)
@@ -2180,7 +2223,7 @@ describe("createRotatingFetch", () => {
         const waiting = fetch("https://api.example.com/overage-stale")
         await usageReady
         testCase.mutate(state, accounts)
-        releaseUsage(usageResponse(usageBody({ rollingUsage: usageWindow("rate-limited") })))
+        releaseUsage(usageResponse(usageBody({ usage: { rolling: usageWindow("rate-limited") } })))
         expect((await waiting).status).toBe(200)
         expect(upstreamAuth).toEqual(["Bearer key-overage-b"])
         expect(usageCalls).toBe(1)
@@ -2224,7 +2267,7 @@ describe("createRotatingFetch", () => {
       await usageReady
       state.blocked.add(0)
       state.blocked.add(1)
-      releaseUsage(usageResponse(usageBody({ rollingUsage: usageWindow("rate-limited") })))
+      releaseUsage(usageResponse(usageBody({ usage: { rolling: usageWindow("rate-limited") } })))
 
       await expect(waiting).rejects.toThrow("No enabled Go accounts")
       expect(upstreamAuth).toEqual([])
@@ -2271,7 +2314,7 @@ describe("createRotatingFetch", () => {
       await usageReady
       state.blocked.add(1)
       state.blocked.add(2)
-      releaseUsage(usageResponse(usageBody({ rollingUsage: usageWindow("rate-limited") })))
+      releaseUsage(usageResponse(usageBody({ usage: { rolling: usageWindow("rate-limited") } })))
 
       const response = await waiting
       expect(upstreamAuth).toEqual(["Bearer key-primary"])
@@ -2295,13 +2338,9 @@ describe("createRotatingFetch", () => {
       })
       let now = 1_000
       const waits: number[] = []
-      let cancelCalls = 0
+      const cancelSpy = spyReadableStreamCancel()
       const upstreamAuth: string[] = []
       const retained = mockRes(429, "quota exceeded")
-      retained.body!.cancel = () => {
-        cancelCalls++
-        return new Promise(() => {})
-      }
       let primaryCalls = 0
       const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
         if (isUsageRequest(input)) {
@@ -2317,30 +2356,34 @@ describe("createRotatingFetch", () => {
         return mockRes(200)
       }
 
-      const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
-        logger: quietLogger,
-        now: () => now,
-        wait: async (delayMs) => {
-          waits.push(delayMs)
-          now += delayMs
-        },
-      })
-      state.cooldownUntil.set(2, 61_000)
+      try {
+        const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, {
+          logger: quietLogger,
+          now: () => now,
+          wait: async (delayMs) => {
+            waits.push(delayMs)
+            now += delayMs
+          },
+        })
+        state.cooldownUntil.set(2, 61_000)
 
-      const pending = fetch("https://api.example.com/recover-after-wait")
-      await usageReady
-      state.blocked.add(1)
-      state.blocked.add(2)
-      releaseUsage(usageResponse(usageBody({ rollingUsage: usageWindow("rate-limited") })))
+        const pending = fetch("https://api.example.com/recover-after-wait")
+        await usageReady
+        state.blocked.add(1)
+        state.blocked.add(2)
+        releaseUsage(usageResponse(usageBody({ usage: { rolling: usageWindow("rate-limited") } })))
 
-      const response = await pending
-      expect(response.status).toBe(200)
-      expect(upstreamAuth).toEqual(["Bearer key-primary", "Bearer key-primary"])
-      expect(waits).toEqual([60_000])
-      expect(cancelCalls).toBe(1)
-      expect(retained.body?.locked).toBe(false)
-      expect(state.blocked.has(1)).toBe(true)
-      expect(state.blocked.has(2)).toBe(true)
+        const response = await pending
+        expect(response.status).toBe(200)
+        expect(upstreamAuth).toEqual(["Bearer key-primary", "Bearer key-primary"])
+        expect(waits).toEqual([60_000])
+        expect(cancelSpy.calls).toBe(1)
+        expect(retained.body?.locked).toBe(false)
+        expect(state.blocked.has(1)).toBe(true)
+        expect(state.blocked.has(2)).toBe(true)
+      } finally {
+        cancelSpy.restore()
+      }
     })
 
     it("fails open and releases a stalled usage body reader at the 750ms bound", async () => {
@@ -2566,7 +2609,7 @@ describe("createRotatingFetch", () => {
       const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
         if (isUsageRequest(input)) {
           usageCalls++
-          return usageResponse(usageBody({ rollingUsage: usageWindow("rate-limited") }))
+          return usageResponse(usageBody({ usage: { rolling: usageWindow("rate-limited") } }))
         }
         upstreamAuth.push(requestHeaders(input, init).get("Authorization")!)
         return mockRes(200)
@@ -2672,17 +2715,13 @@ describe("createRotatingFetch", () => {
         mk("key-cooling", true, "cooling", "primary"),
       ]
       const abort = new Error("caller cancelled during post-response consult")
-      let cancelCalls = 0
+      const cancelSpy = spyReadableStreamCancel()
       const rejections: unknown[] = []
       const onUnhandled = (reason: unknown) => {
         rejections.push(reason)
       }
       process.on("unhandledRejection", onUnhandled)
       const quota = mockRes(429, "quota exceeded")
-      quota.body!.cancel = () => {
-        cancelCalls++
-        return new Promise(() => {})
-      }
       let releaseUsage!: (response: Response) => void
       const usageGate = new Promise<Response>((resolve) => {
         releaseUsage = resolve
@@ -2717,7 +2756,7 @@ describe("createRotatingFetch", () => {
         controller.abort(abort)
         await expect(pending).rejects.toBe(abort)
         expect(upstreamAuth).toEqual(["Bearer key-primary"])
-        expect(cancelCalls).toBe(1)
+        expect(cancelSpy.calls).toBe(1)
         expect(quota.body?.locked).toBe(false)
         expect(getEventListeners(controller.signal, "abort")).toHaveLength(0)
         await Promise.resolve()
@@ -2726,6 +2765,7 @@ describe("createRotatingFetch", () => {
         expect(state.activeIndex).toBe(0)
         expect(state.blocked.size).toBe(0)
       } finally {
+        cancelSpy.restore()
         process.off("unhandledRejection", onUnhandled)
         releaseUsage(usageResponse())
       }
@@ -3003,7 +3043,7 @@ describe("createRotatingFetch", () => {
       ]
       const warnings: Array<{ msg: string; data?: Record<string, unknown> }> = []
       const baseFetch = async (input: RequestInfo | URL) => {
-        if (isUsageRequest(input)) return usageResponse(usageBody({ useBalance: true, rollingUsage: usageWindow("rate-limited") }))
+        if (isUsageRequest(input)) return usageResponse(usageBody({ useBalance: true, usage: { rolling: usageWindow("rate-limited") } }))
         return mockRes(200)
       }
 

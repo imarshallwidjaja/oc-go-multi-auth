@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test"
 import { mkdtempSync, rmSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
-import { loadAccounts } from "../storage"
+import { loadAccounts, saveAccounts } from "../storage"
 
 const origHome = process.env.HOME
 let tmpHome: string
@@ -61,5 +61,28 @@ describe("oc-go-multi-auth cli roles", () => {
     expect((await runCli("add", "--key", "go_a", "--role", "paid")).exitCode).toBe(1)
     expect((await runCli("add", "--key", "go_a")).exitCode).toBe(0)
     expect((await runCli("set-role", "1", "paid")).exitCode).toBe(1)
+  })
+
+  it("prints the usage report without leaking API keys", async () => {
+    const empty = await runCli("usage")
+    expect(empty.exitCode).toBe(0)
+    expect(empty.stdout).toContain("No Go accounts configured.")
+
+    saveAccounts({
+      version: 1,
+      accounts: [
+        { apiKey: "go_secret_key_x1ab", label: "Work", addedAt: Date.now(), enabled: false, role: "primary" },
+        { apiKey: "go_secret_key_old1", addedAt: Date.now(), enabled: false, role: "overage_fallback" },
+      ],
+      rotationIndex: 0,
+    })
+    const listed = await runCli("usage")
+    expect(listed.exitCode).toBe(0)
+    expect(listed.stdout).toContain("OpenCode Go usage")
+    expect(listed.stdout).toContain("1. Work  [primary]  disabled (not queried)")
+    expect(listed.stdout).toContain("2. Account 2  [overage_fallback]  disabled (not queried)")
+    expect(listed.stdout).not.toContain("go_secret_key_x1ab")
+    expect(listed.stdout).not.toContain("go_secret_key_old1")
+    expect(listed.stderr).toBe("")
   })
 })

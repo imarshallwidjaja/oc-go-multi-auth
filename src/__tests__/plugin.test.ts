@@ -99,6 +99,9 @@ function createV2Context({
   let connected = alreadyConnected
   let integrationRegistrations = 0
   const catalogTransforms: Array<(editor: any) => void> = []
+  const commands: Array<{ name: string; description?: string; execute: (input: { sessionID: string }) => Promise<void> }> = []
+  const synthetics: Array<{ sessionID: string; text: string }> = []
+  let commandRegistrations = 0
   const baseProvider: CatalogProvider = {
     id: "opencode-go",
     name: "OpenCode Go",
@@ -207,6 +210,36 @@ function createV2Context({
         }
       },
     },
+    command: {
+      transform: async (transform: (editor: any) => void) => {
+        order.push("command.transform")
+        commandRegistrations++
+        const added: typeof commands = []
+        transform({
+          add(definition: { name: string; description?: string; execute: (input: { sessionID: string }) => Promise<void> }) {
+            added.push(definition)
+            commands.push(definition)
+          },
+        })
+        let active = true
+        return {
+          dispose: async () => {
+            if (!active) return
+            active = false
+            commandRegistrations--
+            for (const definition of added) {
+              const index = commands.indexOf(definition)
+              if (index !== -1) commands.splice(index, 1)
+            }
+          },
+        }
+      },
+    },
+    session: {
+      synthetic: async (input: { sessionID: string; text: string }) => {
+        synthetics.push(input)
+      },
+    },
   } as any
 
   return {
@@ -216,6 +249,9 @@ function createV2Context({
     get catalogModels() { return catalogModels },
     get integrationRegistrations() { return integrationRegistrations },
     get catalogRegistrations() { return catalogTransforms.length },
+    get commandRegistrations() { return commandRegistrations },
+    commands,
+    synthetics,
     integrations,
     methods,
     order,
@@ -410,6 +446,51 @@ describe("OpenCode V1 adapter", () => {
       installedFetch.restore()
     }
   })
+
+  it("registers config.command[\"go-usage\"] and command.execute.before writes the report and sets noReply", async () => {
+    saveAccounts({
+      version: 1,
+      accounts: [{ apiKey: "secret-key-x1ab", label: "Work", addedAt: 10, enabled: true, role: "primary" }],
+      rotationIndex: 0,
+    })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      expect(String(input instanceof Request ? input.url : input)).toBe("https://opencode.ai/zen/go/v1/usage")
+      return Response.json({
+        usage: {
+          rolling: { status: "ok", percent: 12, resetsAt: "2026-09-15T08:00:00.000Z" },
+          weekly: { status: "ok", percent: 40, resetsAt: "2026-09-20T00:00:00.000Z" },
+          monthly: { status: "ok", percent: 90, resetsAt: "2026-10-01T00:00:00.000Z" },
+        },
+      })
+    }) as typeof fetch
+
+    try {
+      const client = { auth: { set: async () => authSetSuccess() } }
+      const hooks = await plugin.server(pluginInput(client))
+      const config: { command?: Record<string, { template: string; description?: string }> } = {}
+      await hooks.config!(config as any)
+
+      expect(config.command?.["go-usage"]).toEqual({
+        template: "OpenCode Go usage",
+        description: "Show remaining OpenCode Go quota for stored accounts",
+      })
+
+      const output: { parts: Array<{ type: string; text: string }>; noReply?: boolean } = { parts: [] }
+      await hooks["command.execute.before"]!(
+        { command: "go-usage", sessionID: "sess-1", arguments: "" },
+        output as any,
+      )
+
+      expect(output.noReply).toBe(true)
+      expect(output.parts[0]?.type).toBe("text")
+      expect(output.parts[0]?.text).toContain("1. Work  [primary]  key ...x1ab  remaining")
+      expect(output.parts[0]?.text).toContain("12% used")
+      expect(output.parts[0]?.text).not.toContain("secret-key-x1ab")
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
 })
 
 describe("OpenCode V2 adapter", () => {
@@ -425,6 +506,7 @@ describe("OpenCode V2 adapter", () => {
 
     expect(harness.order).toEqual([
       "integration.transform",
+      "command.transform",
       "catalog.transform",
       "integration.connection.active",
       "integration.connect.key",
@@ -512,6 +594,7 @@ describe("OpenCode V2 adapter", () => {
     expect(harness.connections).toEqual([{ integrationID: "opencode-go", key: "key-a" }])
     expect(harness.integrationRegistrations).toBe(1)
     expect(harness.catalogRegistrations).toBe(1)
+    expect(harness.commandRegistrations).toBe(1)
     expect(loadRotationState()).toEqual({ lastUsedIndex: -1 })
   })
 
@@ -580,7 +663,8 @@ describe("OpenCode V2 adapter", () => {
     expect(harness.catalogProvider.package).toBe("aisdk:@ai-sdk/openai-compatible")
     expect(harness.connections).toEqual([])
     expect(harness.catalogRegistrations).toBe(0)
-    expect(harness.order).toEqual(["integration.transform"])
+    expect(harness.commandRegistrations).toBe(1)
+    expect(harness.order).toEqual(["integration.transform", "command.transform"])
   })
 
   it("does not replace an already-active connection", async () => {
@@ -596,8 +680,54 @@ describe("OpenCode V2 adapter", () => {
     expect(harness.connections).toEqual([])
     expect(harness.order).toEqual([
       "integration.transform",
+      "command.transform",
       "catalog.transform",
       "integration.connection.active",
     ])
+  })
+
+  it("registers go-usage via command.transform even with zero accounts", async () => {
+    const harness = createV2Context()
+    await plugin.setup(harness.context)
+
+    expect(harness.commands.map((command) => command.name)).toEqual(["go-usage"])
+    await harness.commands[0].execute({ sessionID: "sess-empty" })
+    expect(harness.synthetics[0]).toMatchObject({ sessionID: "sess-empty" })
+    expect(harness.synthetics[0].text).toContain("No Go accounts configured.")
+  })
+
+  it("posts the go-usage report through session.synthetic without sending a full key", async () => {
+    saveAccounts({
+      version: 1,
+      accounts: [{ apiKey: "secret-key-x1ab", label: "Work", addedAt: 10, enabled: true, role: "primary" }],
+      rotationIndex: 0,
+    })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const request = input instanceof Request ? input : new Request(input)
+      expect(request.headers.get("Authorization")).toBe("Bearer secret-key-x1ab")
+      return Response.json({
+        usage: {
+          rolling: { status: "ok", percent: 12, resetsAt: "2026-09-15T08:00:00.000Z" },
+          weekly: { status: "ok", percent: 40, resetsAt: "2026-09-20T00:00:00.000Z" },
+          monthly: { status: "ok", percent: 90, resetsAt: "2026-10-01T00:00:00.000Z" },
+        },
+      })
+    }) as typeof fetch
+    const harness = createV2Context()
+
+    try {
+      await plugin.setup(harness.context)
+      const command = harness.commands.find((entry) => entry.name === "go-usage")
+      expect(command).toBeDefined()
+      await command!.execute({ sessionID: "sess-1" })
+
+      expect(harness.synthetics).toHaveLength(1)
+      expect(harness.synthetics[0].sessionID).toBe("sess-1")
+      expect(harness.synthetics[0].text).toContain("1. Work  [primary]  key ...x1ab  remaining")
+      expect(JSON.stringify(harness.synthetics)).not.toContain("secret-key-x1ab")
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   })
 })

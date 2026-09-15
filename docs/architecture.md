@@ -12,14 +12,16 @@ src/
 ├── storage.ts     # Atomic file I/O for accounts & rotation state
 ├── rotate.ts      # Round-robin account selection logic
 ├── fetch.ts       # Auth header injection + credential failover interceptor
+├── usage.ts       # Live usage parse, per-account collect, and report format
 ├── runtime.ts     # Shared rotation initialization and sticky-state persistence
-├── index.ts       # V1 server and V2 catalog/integration setup entry point
+├── index.ts       # V1 server and V2 catalog/integration/command setup entry point
 ├── v2-provider.ts # V2 native provider transport adapter
-├── cli.ts         # List, remove, and inspect stored accounts
+├── cli.ts         # List, remove, inspect, and report usage for stored accounts
 └── __tests__/     # automated tests
     ├── storage.test.ts
     ├── rotate.test.ts
     ├── fetch.test.ts
+    ├── usage.test.ts
     ├── cli.test.ts
     ├── plugin.test.ts
     └── v2-provider.test.ts
@@ -67,11 +69,11 @@ src/
 
 ### Session Start on V2
 
-V2 calls `setup()` directly. Setup first registers an `opencode-go` key method through `ctx.integration.transform`. When an account is enabled, it registers `ctx.catalog.transform`, normalizes the three supported AI SDK packages using the OpenCode 2.0.2 mapping contract, records their original provider/model packages, and redirects them to `oc-go-multi-auth/v2/provider`. Unsupported provider and model packages are left unchanged. A model package takes precedence over its provider package.
+V2 calls `setup()` directly. Setup first registers an `opencode-go` key method through `ctx.integration.transform`, then registers `/go-usage` through `ctx.command.transform`. When an account is enabled, it registers `ctx.catalog.transform`, normalizes the three supported AI SDK packages using the OpenCode 2.0.2 mapping contract, records their original provider/model packages, and redirects them to `oc-go-multi-auth/v2/provider`. Unsupported provider and model packages are left unchanged. A model package takes precedence over its provider package.
 
 The V2 provider module delegates construction to the recorded native `@opencode/ai` provider and replaces only its HTTP middleware. OpenAI-compatible chat, OpenAI responses, and Anthropic messages overrides are preserved. The catalog transform never routes an unsupported package to this module.
 
-After rotation is registered, setup optionally seeds an integration connection from the first enabled stored account when no connection exists. Empty account storage skips both the catalog transform and connection write until the next restart. A connection-seeding failure is logged and leaves the catalog registration active. Repeated setup disposes the previous registrations before adding replacements.
+After rotation is registered, setup optionally seeds an integration connection from the first enabled stored account when no connection exists. Empty account storage skips both the catalog transform and connection write until the next restart. `/go-usage` is still registered in that case so the command can report that no accounts are configured. A connection-seeding failure is logged and leaves the catalog registration active. Repeated setup disposes the previous registrations before adding replacements.
 
 ### Request Flow
 
@@ -140,7 +142,7 @@ authorize({ account, role })
     ├── saveAccounts() to disk
     └── return success
 
-User runs oc-go-multi-auth list/add/set-role/remove/status
+User runs oc-go-multi-auth list/add/set-role/remove/status/usage
          │
          ▼
 cli.ts
@@ -148,7 +150,8 @@ cli.ts
     ├── list: print labels, enabled state, role, and persisted current marker
     ├── set-role: update primary / overage_fallback preference
     ├── remove: splice the selected 1-based account number and save
-    └── status: print account counts by role and persisted rotation state
+    ├── status: print account counts by role and persisted rotation state
+    └── usage: GET /zen/go/v1/usage for enabled accounts and print the report
 ```
 
 ---
@@ -231,7 +234,7 @@ Wraps `globalThis.fetch` (or a provided `baseFetch`) to:
 8. **On success:** Accept the state mutation only when the attempt's account generation still matches. Clear a cooldown but never an auth block. A successful failover replacement updates the persisted rotation index only if no newer request has succeeded.
 9. **On initial all-unavailable entry:** Probe the sticky enabled credential once and return that real response. Never create a synthetic exhaustion response.
 10. **On mid-request stale exhaustion:** Return the last real response. If none exists, preserve or throw the existing transport or error terminal. Never probe blocked or already-attempted credentials, and never create a synthetic response.
-11. **On first overage crossing:** Before the first overage attempt, consult cooling primaries with a bounded usage lookup and allow at most one advisory primary attempt. Uncertainty fails open to the existing overage path only while the caller remains active; caller cancellation stops advisory classification and does not send overage. See [quota-rotation.md](./quota-rotation.md#advisory-usage-at-overage-crossing) for the full contract.
+11. **On first overage crossing:** Before the first overage attempt, consult cooling primaries with a bounded usage lookup and allow at most one advisory primary attempt. Uncertainty fails open to the existing overage path only while the caller remains active; caller cancellation stops advisory classification and does not send overage. Advisory eligibility uses the same live usage parser as `/go-usage`. See [quota-rotation.md](./quota-rotation.md#advisory-usage-at-overage-crossing) for the full contract.
 
 Traversal state is request-scoped, so one logical request attempts each enabled, available credential at most once. Auth blocks and cooldown deadlines are process-local. Per-account availability generations reject stale success and penalty mutations. Global request-success ordering prevents an older request from changing or persisting stickiness after a newer request succeeds, without serializing requests.
 
@@ -240,6 +243,10 @@ The interceptor accepts a `baseFetch` parameter for testability:
 ```ts
 const { fetch } = createRotatingFetch(accounts, lastIndex, mockFetch)
 ```
+
+### `usage.ts` — Live usage report
+
+Parses `GET https://opencode.ai/zen/go/v1/usage` JSON (`usage.rolling` / `weekly` / `monthly` with `status`, used `percent`, and `resetsAt`). Collects enabled accounts concurrently with bearer auth, leaves disabled accounts unqueried, and formats a text report. Optional `useBalance` and a numeric USD `balance` / `balance.usd` are displayed when present and well-typed; they are not required. Advisory rotation in `fetch.ts` calls the same parser. User-initiated lookups are always fresh and use an 8s timeout; advisory lookups stay at 750ms with the existing 5s eligibility cache.
 
 ### `runtime.ts` — Rotation Initialization
 
@@ -264,7 +271,7 @@ const plugin = {
 export default { ...plugin, server } // V1 1.18.29+ calls server()
 ```
 
-The adapters share only version-neutral account selection, persistence, and rotating-fetch construction. V1's `loader` and **Add Go Account** authorize function use `authClient.auth.set()` and return V1 auth hooks. V2 registers its key method through the integration editor and its package-local native transport through the catalog editor. Account listing, removal, and status are implemented separately in `cli.ts`.
+The adapters share only version-neutral account selection, persistence, rotating-fetch construction, and the usage report. V1's `loader` and **Add Go Account** authorize function use `authClient.auth.set()` and return V1 auth hooks. V1 also registers `command["go-usage"]` and fills `command.execute.before` with the report plus `noReply: true` so newer V1 hosts skip the LLM turn. V2 registers its key method through the integration editor, `/go-usage` through the command editor (posted with `session.synthetic`), and its package-local native transport through the catalog editor. Account listing, removal, status, and usage are implemented separately in `cli.ts`.
 
 ---
 
@@ -328,7 +335,7 @@ The returned V1 `Hooks.auth` object has:
 - `loader(getAuth) -> { apiKey, fetch }` — called at session start
 - `methods: AuthMethod[]` — available to the user via command palette
 
-The V1 auth methods use `type: "api"` for credential-based actions. V2 calls `setup()` and does not expose those methods, so V2 account management uses the `oc-go-multi-auth` CLI. The shared default export only packages both implementations together; it does not translate hooks or client calls between APIs.
+The V1 auth methods use `type: "api"` for credential-based actions. V2 calls `setup()` and does not expose those methods, so V2 account management uses the `oc-go-multi-auth` CLI. Both adapters expose `/go-usage` (V1 via `config.command` + `command.execute.before`, V2 via `command.transform` + `session.synthetic`). The shared default export only packages both implementations together; it does not translate hooks or client calls between APIs.
 
 ---
 
@@ -336,5 +343,5 @@ The V1 auth methods use `type: "api"` for credential-based actions. V2 calls `se
 
 - **API keys are stored in plaintext** on disk (`~/.config/opencode/`). Only the owner can read them (`0o600`).
 - **Keys are held in memory** for the duration of the session.
-- **Independent network calls** are limited to the advisory `GET https://opencode.ai/zen/go/v1/usage` lookup at the first primary-to-overage crossing. That request uses the captured underlying transport without recursively entering rotation. On V2 it still passes through the host-supplied HTTP middleware and handler.
+- **Independent network calls** are the advisory `GET https://opencode.ai/zen/go/v1/usage` lookup at the first primary-to-overage crossing, and the same endpoint when a user runs `/go-usage` or `oc-go-multi-auth usage`. Advisory lookups use the captured underlying transport without recursively entering rotation. On V2 they still pass through the host-supplied HTTP middleware and handler. User-initiated usage lookups use ordinary `fetch` with each account's bearer key and do not go through rotation. The endpoint returns percent windows, not remaining dollars.
 - **Plugin API dependencies** use optional peers for the `@opencode-ai/plugin` V1 declarations and `@opencode/plugin` V2 declarations. The package-local V2 provider has direct runtime dependencies on the exact `@opencode/ai` 2.0.2 contract and its matching Effect release.

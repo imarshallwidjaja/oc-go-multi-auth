@@ -17,7 +17,8 @@ The package source contains separate OpenCode V1 and V2 adapters. OpenCode V1 1.
 - **Overage preference roles** — Tag a paid-overage account as `overage_fallback` so the plugin prefers primaries and demotes sticky off overage as soon as a primary is available again.
 - **Live-session account stickiness** — Successful requests keep using the same account when it remains preferred. A successful replacement becomes sticky for later requests and is persisted as the rotation position.
 - **Safe response classification** — HTTP 401/402 and clear credential signals block an account for the process. Clear quota, rate, or usage signals apply a bounded cooldown. Engine overload and unknown 429 responses are returned unchanged without rotating or penalizing an account.
-- **CLI account management** — Add, list, set role, remove, and inspect accounts from the terminal.
+- **Quota report** — `/go-usage` and `oc-go-multi-auth usage` query `GET https://opencode.ai/zen/go/v1/usage` for every stored account and print remaining vs used percent for the 5-hour, weekly, and monthly windows. Remaining dollars are not on that endpoint today.
+- **CLI account management** — Add, list, set role, remove, inspect, and report usage for accounts from the terminal.
 - **Persistent state** — Accounts and rotation position survive restarts.
 - **No modifications to OpenCode** — Installs as a plugin, zero risk to your existing setup.
 
@@ -110,7 +111,7 @@ OpenCode V1 exposes auth methods for this plugin:
 | `api` | **Add Go Account** | Add a new Go API key to the rotation pool |
 | `api` | **Set Go Account Role** | Change an existing account's `primary` / `overage_fallback` role |
 
-Use the CLI for account management and status:
+Use the CLI for account management, status, and quota:
 
 | Command | Purpose |
 |---|---|
@@ -119,8 +120,12 @@ Use the CLI for account management and status:
 | `oc-go-multi-auth set-role <number> <primary\|overage_fallback>` | Set an account's preference role |
 | `oc-go-multi-auth remove <number>` | Remove an account by its 1-based list number |
 | `oc-go-multi-auth status` | Show account counts by role and persisted rotation state |
+| `oc-go-multi-auth usage` | Query remaining Go quota windows for every stored account |
+| `/go-usage` | Same report inside OpenCode |
 
-On V1, run **Add Go Account** from OpenCode's auth settings so the first key also primes the `opencode-go` auth store. On V2, use the CLI and restart OpenCode after adding the first account. V2 setup leaves the catalog unchanged when no account is enabled. On restart, it redirects supported OpenAI-compatible, OpenAI, and Anthropic catalog packages to the bundled native transport and seeds an integration connection when none exists.
+`/go-usage` and `oc-go-multi-auth usage` call `GET https://opencode.ai/zen/go/v1/usage` with each enabled account's API key. The endpoint returns percent-used for the rolling (5-hour), weekly, and monthly windows. It does not currently return remaining dollars. Disabled accounts are listed as not queried. Per-account HTTP or network failures stay on that account; the rest of the report still prints.
+
+On V1, run **Add Go Account** from OpenCode's auth settings so the first key also primes the `opencode-go` auth store. On V2, use the CLI and restart OpenCode after adding the first account. V2 setup leaves the catalog unchanged when no account is enabled, and still registers `/go-usage`. On restart, it redirects supported OpenAI-compatible, OpenAI, and Anthropic catalog packages to the bundled native transport and seeds an integration connection when none exists.
 
 ---
 
@@ -153,7 +158,7 @@ Both files use `0o600` permissions. The accounts file is written atomically (tmp
 git clone https://github.com/imarshallwidjaja/oc-go-multi-auth
 cd oc-go-multi-auth
 bun install
-bun test       # tests across 7 modules
+bun test       # unit tests
 bun run build  # builds declarations and the V1/V2 package entrypoints
 bun run typecheck  # tsc --noEmit
 ```
@@ -170,6 +175,7 @@ bun run typecheck  # tsc --noEmit
        │
        ├──▶ rotate.ts     ── round-robin selection
        ├──▶ fetch.ts      ── auth header injection + credential failover
+       ├──▶ usage.ts      ── live Go usage parse, collect, and report
        └──▶ types.ts      ── shared type definitions
 ```
 

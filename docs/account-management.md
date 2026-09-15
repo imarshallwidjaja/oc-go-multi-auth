@@ -13,7 +13,7 @@ The plugin provides these auth methods in OpenCode V1 1.18.29+:
 | **Add Go Account** | Add a new Go API key to the pool |
 | **Set Go Account Role** | Change an existing account's preference role |
 
-These account-management and status commands work with V1 and V2:
+These account-management, status, and quota commands work with V1 and V2:
 
 | Command | What it does |
 |---|---|
@@ -22,6 +22,8 @@ These account-management and status commands work with V1 and V2:
 | `oc-go-multi-auth set-role <number> <primary\|overage_fallback>` | Set an account's preference role |
 | `oc-go-multi-auth remove <number>` | Remove an account by its 1-based list number |
 | `oc-go-multi-auth status` | Show account counts by role and persisted rotation state |
+| `oc-go-multi-auth usage` | Query remaining Go quota windows for every stored account |
+| `/go-usage` | Same report inside OpenCode |
 
 ---
 
@@ -99,6 +101,8 @@ oc-go-multi-auth set-role 3 overage_fallback
 On V1, you can instead use **Settings → Auth → Set Go Account Role** and enter the list number plus `primary` or `overage_fallback`.
 
 For the account count by role and raw persisted rotation values, run `oc-go-multi-auth status`.
+
+To see remaining vs used percent for each stored account, run `oc-go-multi-auth usage` or type `/go-usage` in OpenCode. Both call `GET https://opencode.ai/zen/go/v1/usage`. An account still has usage left when every window status is `ok`. The endpoint returns the 5-hour, weekly, and monthly percent windows; it does not currently return remaining dollars.
 
 Primaries with OpenCode Go **Use balance** enabled may spend Zen balance without producing a rotatable failure. Disable Use balance on primary accounts when you want strict overage minimization.
 

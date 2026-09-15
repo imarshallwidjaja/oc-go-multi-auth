@@ -2,6 +2,7 @@ import { log } from "./logger.js"
 import { USAGE_URL } from "./opencode.js"
 import { selectAccount } from "./rotate.js"
 import type { GoAccount } from "./types.js"
+import { accountHasRemaining, MAX_USAGE_BODY_BYTES, parseUsagePayload, readBoundedJson } from "./usage.js"
 
 export interface RotatingFetchState {
   activeIndex: number
@@ -46,7 +47,6 @@ interface RotatingFetchOptions {
 }
 
 const MAX_CLASSIFICATION_BODY_BYTES = 64 * 1024
-const MAX_USAGE_BODY_BYTES = 8 * 1024
 const DEFAULT_INSPECTION_TIMEOUT_MS = 1_000
 const USAGE_LOOKUP_TIMEOUT_MS = 750
 const USAGE_CACHE_TTL_MS = 5_000
@@ -357,104 +357,18 @@ function waitForCooldown(delayMs: number, signal: AbortSignal) {
 
 type UsageGuidance = { eligible: boolean; useBalance: boolean }
 
-function isUsageWindow(value: unknown) {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false
-  const window = value as Record<string, unknown>
-  if (window.status !== "ok" && window.status !== "rate-limited") return false
-  if (typeof window.usagePercent !== "number" || !Number.isFinite(window.usagePercent)) return false
-  if (window.usagePercent < 0 || window.usagePercent > 100) return false
-  if (typeof window.resetInSec !== "number" || !Number.isFinite(window.resetInSec)) return false
-  return window.resetInSec >= 0
-}
-
-function parseUsagePayload(value: unknown) {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null
-  const body = value as Record<string, unknown>
-  if (typeof body.useBalance !== "boolean") return null
-  if (!isUsageWindow(body.rollingUsage) || !isUsageWindow(body.weeklyUsage) || !isUsageWindow(body.monthlyUsage)) {
-    return null
-  }
-  return {
-    useBalance: body.useBalance,
-    rollingUsage: body.rollingUsage as { status: "ok" | "rate-limited" },
-    weeklyUsage: body.weeklyUsage as { status: "ok" | "rate-limited" },
-    monthlyUsage: body.monthlyUsage as { status: "ok" | "rate-limited" },
-  }
-}
-
-async function readBoundedJson(response: Response, maxBytes: number, signal: AbortSignal) {
-  const contentLength = Number(response.headers.get("content-length"))
-  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-    discardResponse(response)
-    return undefined
-  }
-
-  if (!response.body) return undefined
-  const reader = response.body.getReader()
-  const decoder = new TextDecoder()
-  let size = 0
-  let text = ""
-  const cancelReader = () => {
-    void reader.cancel().catch(() => {})
-  }
-  if (signal.aborted) {
-    cancelReader()
-    try {
-      reader.releaseLock()
-    } catch {}
-    return undefined
-  }
-  try {
-    while (true) {
-      if (signal.aborted) {
-        cancelReader()
-        return undefined
-      }
-      const { done, value } = await raceAbort(reader.read(), signal)
-      if (signal.aborted) {
-        cancelReader()
-        return undefined
-      }
-      if (done) {
-        text += decoder.decode()
-        break
-      }
-      size += value.byteLength
-      if (size > maxBytes) {
-        cancelReader()
-        return undefined
-      }
-      text += decoder.decode(value, { stream: true })
-    }
-  } catch {
-    cancelReader()
-    return undefined
-  } finally {
-    try {
-      reader.releaseLock()
-    } catch {}
-  }
-
-  try {
-    return JSON.parse(text) as unknown
-  } catch {
-    return undefined
-  }
-}
-
 async function readUsageGuidance(response: Response, signal: AbortSignal): Promise<UsageGuidance> {
   if (response.status !== 200) {
     discardResponse(response)
     return { eligible: false, useBalance: false }
   }
   const json = await readBoundedJson(response, MAX_USAGE_BODY_BYTES, signal)
-  if (json === undefined) return { eligible: false, useBalance: false }
-  const payload = parseUsagePayload(json)
+  if (!json.ok) return { eligible: false, useBalance: false }
+  const payload = parseUsagePayload(json.value)
   if (!payload) return { eligible: false, useBalance: false }
-  const windows = [payload.rollingUsage, payload.weeklyUsage, payload.monthlyUsage]
   return {
-    eligible: windows.every((window) => window.status === "ok"),
-    useBalance: payload.useBalance,
+    eligible: accountHasRemaining(payload),
+    useBalance: payload.useBalance === true,
   }
 }
 

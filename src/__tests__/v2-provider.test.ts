@@ -171,10 +171,11 @@ describe("OpenCode V2 native provider transport", () => {
       [account("a"), account("b", "overage_fallback")],
       (request) => request.url === "https://opencode.ai/zen/go/v1/usage"
         ? Response.json({
-            useBalance: false,
-            rollingUsage: { status: "ok", usagePercent: 10, resetInSec: 60 },
-            weeklyUsage: { status: "ok", usagePercent: 10, resetInSec: 60 },
-            monthlyUsage: { status: "ok", usagePercent: 10, resetInSec: 60 },
+            usage: {
+              rolling: { status: "ok", percent: 10, resetsAt: "2026-08-13T16:27:38.287Z" },
+              weekly: { status: "ok", percent: 10, resetsAt: "2026-08-13T16:27:38.287Z" },
+              monthly: { status: "ok", percent: 10, resetsAt: "2026-08-13T16:27:38.287Z" },
+            },
           })
         : new Response("success", { status: 200 }),
       "x-api-key",
@@ -248,10 +249,11 @@ describe("OpenCode V2 native provider transport", () => {
       [account("a"), account("b", "overage_fallback")],
       (request) => request.url === "https://opencode.ai/zen/go/v1/usage"
         ? Response.json({
-            useBalance: false,
-            rollingUsage: { status: "ok", usagePercent: 10, resetInSec: 60 },
-            weeklyUsage: { status: "ok", usagePercent: 10, resetInSec: 60 },
-            monthlyUsage: { status: "ok", usagePercent: 10, resetInSec: 60 },
+            usage: {
+              rolling: { status: "ok", percent: 10, resetsAt: "2026-08-13T16:27:38.287Z" },
+              weekly: { status: "ok", percent: 10, resetsAt: "2026-08-13T16:27:38.287Z" },
+              monthly: { status: "ok", percent: 10, resetsAt: "2026-08-13T16:27:38.287Z" },
+            },
           })
         : new Response("success", { status: 200 }),
     )

@@ -5,6 +5,11 @@ import { log } from "./logger.js"
 import { NATIVE_PACKAGE_SETTING, V2_NATIVE_PACKAGE_IDS } from "./opencode.js"
 import { parseAccountRole, type AccountRole } from "./types.js"
 import { initializeRotation } from "./runtime.js"
+import {
+  GO_USAGE_COMMAND,
+  GO_USAGE_DESCRIPTION,
+  reportGoUsage,
+} from "./usage.js"
 
 const PROVIDER_ID = "opencode-go"
 const V2_PROVIDER_PACKAGE = "oc-go-multi-auth/v2/provider"
@@ -84,8 +89,36 @@ function parseOptionalRole(value: unknown): AccountRole | null {
   return parseAccountRole(value)
 }
 
+type V1CommandConfig = {
+  template: string
+  description?: string
+  agent?: string
+  model?: string
+  subtask?: boolean
+}
+
+type V1CommandExecuteOutput = {
+  parts: Array<{ type: "text"; text: string }>
+  noReply?: boolean
+}
+
 function createV1Hooks(setAuth: (key: string) => Promise<void>): Hooks {
   return {
+    async config(input) {
+      const commands: Record<string, V1CommandConfig> = { ...input.command }
+      commands[GO_USAGE_COMMAND] = {
+        template: "OpenCode Go usage",
+        description: GO_USAGE_DESCRIPTION,
+      }
+      input.command = commands
+    },
+    async "command.execute.before"(input, output) {
+      if (input.command !== GO_USAGE_COMMAND) return
+      const text = await reportGoUsage()
+      const commandOutput = output as V1CommandExecuteOutput
+      commandOutput.parts = [{ type: "text", text }]
+      commandOutput.noReply = true
+    },
     auth: {
       provider: PROVIDER_ID,
       async loader() {
@@ -216,6 +249,17 @@ const plugin = {
       })
     })
 
+    const commandRegistration = await ctx.command.transform((editor) => {
+      editor.add({
+        name: GO_USAGE_COMMAND,
+        description: GO_USAGE_DESCRIPTION,
+        execute: async ({ sessionID }) => {
+          const text = await reportGoUsage()
+          await ctx.session.synthetic({ sessionID, text })
+        },
+      })
+    })
+
     const account = loadAccounts().accounts.find((candidate) => candidate.enabled)
     if (!account) {
       log("warn", "catalog rotation setup skipped", { reason: "no enabled accounts", action: "restart after adding an account" })
@@ -224,7 +268,7 @@ const plugin = {
         if (!active) return
         active = false
         if (v2Setups.get(ctx) === cleanup) v2Setups.delete(ctx)
-        await integrationRegistration.dispose()
+        await Promise.all([commandRegistration.dispose(), integrationRegistration.dispose()])
       }
       v2Setups.set(ctx, cleanup)
       return cleanup
@@ -251,7 +295,11 @@ const plugin = {
       if (!active) return
       active = false
       if (v2Setups.get(ctx) === cleanup) v2Setups.delete(ctx)
-      await Promise.all([catalogRegistration.dispose(), integrationRegistration.dispose()])
+      await Promise.all([
+        catalogRegistration.dispose(),
+        commandRegistration.dispose(),
+        integrationRegistration.dispose(),
+      ])
     }
     v2Setups.set(ctx, cleanup)
 

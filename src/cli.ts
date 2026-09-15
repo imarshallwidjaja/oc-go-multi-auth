@@ -5,6 +5,7 @@ import { loadAccounts, saveAccounts, loadRotationState } from "./storage.js"
 import { hasAccounts } from "./rotate.js"
 import { log } from "./logger.js"
 import { parseAccountRole } from "./types.js"
+import { GO_USAGE_DESCRIPTION, reportGoUsage } from "./usage.js"
 
 const program = new Command()
 const packageVersion = (JSON.parse(
@@ -133,4 +134,17 @@ program
     })
   })
 
-program.parse()
+program
+  .command("usage")
+  .description(GO_USAGE_DESCRIPTION)
+  .action(async () => {
+    try {
+      console.log(await reportGoUsage())
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      console.error(`Error: ${detail}`)
+      process.exit(1)
+    }
+  })
+
+await program.parseAsync(process.argv)
