@@ -17,7 +17,7 @@ The package source contains separate OpenCode V1 and V2 adapters. OpenCode V1 1.
 - **Overage preference roles** — Tag a paid-overage account as `overage_fallback` so the plugin prefers primaries and demotes sticky off overage as soon as a primary is available again.
 - **Live-session account stickiness** — Successful requests keep using the same account when it remains preferred. A successful replacement becomes sticky for later requests and is persisted as the rotation position.
 - **Safe response classification** — HTTP 401/402 and clear credential signals block an account for the process. Clear quota, rate, or usage signals apply a bounded cooldown. Engine overload and unknown 429 responses are returned unchanged without rotating or penalizing an account.
-- **Quota report** — `/go-usage` and `oc-go-multi-auth usage` query `GET https://opencode.ai/zen/go/v1/usage` for every stored account and print remaining vs used percent for the 5-hour, weekly, and monthly windows. Remaining dollars are not on that endpoint today.
+- **Quota report** — `/go-usage` and `oc-go-multi-auth usage` query `GET https://opencode.ai/zen/go/v1/usage` for every stored account. The report leads with the summed leftover percent for the 5-hour, weekly, and monthly windows across accounts whose lookup succeeded. A rate-limited window is left out of that window's sum. Each account lists remaining vs used percent. Remaining dollars are not on that endpoint today.
 - **CLI account management** — Add, list, set role, remove, inspect, and report usage for accounts from the terminal.
 - **Persistent state** — Accounts and rotation position survive restarts.
 - **No modifications to OpenCode** — Installs as a plugin, zero risk to your existing setup.
@@ -45,7 +45,9 @@ After the package is published, install it globally:
 bun add --global oc-go-multi-auth
 ```
 
-Add the registry package name to your OpenCode configuration. V1 uses the singular `plugin` key:
+OpenCode V1 loads server plugins from `opencode.json` and TUI plugins from `tui.json`. Add the registry package to both global configuration files:
+
+`~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -53,7 +55,15 @@ Add the registry package name to your OpenCode configuration. V1 uses the singul
 }
 ```
 
-V2 uses the plural `plugins` key:
+`~/.config/opencode/tui.json`:
+
+```json
+{
+  "plugin": ["oc-go-multi-auth"]
+}
+```
+
+OpenCode V2 uses the plural `plugins` key in `opencode.json`:
 
 ```json
 {
@@ -120,10 +130,30 @@ Use the CLI for account management, status, and quota:
 | `oc-go-multi-auth set-role <number> <primary\|overage_fallback>` | Set an account's preference role |
 | `oc-go-multi-auth remove <number>` | Remove an account by its 1-based list number |
 | `oc-go-multi-auth status` | Show account counts by role and persisted rotation state |
-| `oc-go-multi-auth usage` | Query remaining Go quota windows for every stored account |
+| `oc-go-multi-auth usage` | Query Go quota windows for every stored account, led by summed leftover percents |
 | `/go-usage` | Same report inside OpenCode |
 
-`/go-usage` and `oc-go-multi-auth usage` call `GET https://opencode.ai/zen/go/v1/usage` with each enabled account's API key. The endpoint returns percent-used for the rolling (5-hour), weekly, and monthly windows. It does not currently return remaining dollars. Disabled accounts are listed as not queried. Per-account HTTP or network failures stay on that account; the rest of the report still prints.
+`/go-usage` and `oc-go-multi-auth usage` call `GET https://opencode.ai/zen/go/v1/usage` with each enabled account's API key. The report leads with the summed leftover percent for the 5-hour, weekly, and monthly windows across accounts whose lookup succeeded. A rate-limited window is left out of that window's sum. The endpoint returns percent-used for those windows. It does not currently return remaining dollars. Disabled accounts are listed as not queried. Per-account HTTP or network failures stay on that account; the rest of the report still prints. On the V1 screen, that aggregate is the first row.
+
+OpenCode V1 loads `/go-usage` from the package's TUI entrypoint. When using a source checkout instead of the registry package, configure the built files with absolute paths (relative source-checkout paths are not supported):
+
+`~/.config/opencode/opencode.json`:
+
+```json
+{
+  "plugin": ["/absolute/path/to/opencode-go-multi-auth/dist/index.js"]
+}
+```
+
+`~/.config/opencode/tui.json`:
+
+```json
+{
+  "plugin": ["/absolute/path/to/opencode-go-multi-auth/dist/tui.js"]
+}
+```
+
+Select `/go-usage` from slash completion or the command palette. Use Up/Down, PageUp/PageDown, Home/End, and Enter to browse account details; Escape closes the report. If autocomplete is dismissed or unavailable, submitting `/go-usage` sends the literal text as an ordinary prompt even when the TUI plugin is loaded; the V1 server command API cannot suppress that model turn. The same fallback applies if the TUI entrypoint is disabled or fails to load.
 
 On V1, run **Add Go Account** from OpenCode's auth settings so the first key also primes the `opencode-go` auth store. On V2, use the CLI and restart OpenCode after adding the first account. V2 setup leaves the catalog unchanged when no account is enabled, and still registers `/go-usage`. On restart, it redirects supported OpenAI-compatible, OpenAI, and Anthropic catalog packages to the bundled native transport and seeds an integration connection when none exists.
 

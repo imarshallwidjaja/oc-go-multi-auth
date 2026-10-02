@@ -6,6 +6,7 @@ import { saveAccounts } from "../storage"
 import type { GoAccount } from "../types"
 import {
   collectAccountUsage,
+  formatAggregateUsage,
   formatUsageReport,
   parseUsagePayload,
   reportGoUsage,
@@ -220,6 +221,16 @@ describe("formatUsageReport", () => {
       },
     ])
 
+    expect(report.startsWith([
+      "OpenCode Go usage",
+      "",
+      "Aggregate available",
+      "   5-hour   188% left",
+      "   weekly   257% left",
+      "   monthly  209% left",
+      "",
+      "1. Work  [primary]  key ...x1ab  remaining",
+    ].join("\n"))).toBe(true)
     expect(report).toContain("1. Work  [primary]  key ...x1ab  remaining")
     expect(report).toContain("2. Personal  [primary]  key ...zz99  no remaining")
     expect(report).toContain("3. Old  [primary]  disabled (not queried)")
@@ -234,6 +245,20 @@ describe("formatUsageReport", () => {
     expect(report).not.toContain("go_work_key_x1ab")
     expect(report).not.toContain("go_personal_zz99")
     expect(report).not.toContain("go_old_key_dead")
+  })
+
+  it("normalizes displayed label whitespace without exposing short keys", () => {
+    const account = mk("shorter", true, " Work\n\n\t Account ")
+    const report = formatUsageReport([{
+      kind: "error",
+      index: 0,
+      account,
+      error: "unauthorized (401)",
+    }])
+
+    expect(report).toContain("1. Work Account  [primary]  key ****  lookup failed")
+    expect(report).not.toContain("shorter")
+    expect(account.label).toBe(" Work\n\n\t Account ")
   })
 
   it("shows optional USD only when present on a valid payload", () => {
@@ -278,7 +303,76 @@ describe("formatUsageReport", () => {
   })
 
   it("prints that no Go accounts are configured for empty storage", () => {
-    expect(formatUsageReport([])).toContain("No Go accounts configured.")
+    const report = formatUsageReport([])
+    expect(report).toContain("No Go accounts configured.")
+    expect(report).not.toContain("Aggregate")
+    expect(report).not.toContain("no usage data")
+  })
+
+  it("sums leftover percent for ok windows and keeps one decimal when the total is not whole", () => {
+    const rows = [
+      {
+        kind: "ok" as const,
+        index: 0,
+        account: mk("key-aaaa1111", true, "Work"),
+        payload: {
+          rolling: { status: "ok" as const, percent: 11.5, resetsAt: "2026-09-15T08:00:00.000Z" },
+          weekly: { status: "rate-limited" as const, percent: 40, resetsAt: "2026-09-20T00:00:00.000Z" },
+          monthly: { status: "ok" as const, percent: 0, resetsAt: "2026-10-01T00:00:00.000Z" },
+        },
+      },
+      {
+        kind: "ok" as const,
+        index: 1,
+        account: mk("key-bbbb2222", true, "Personal"),
+        payload: {
+          rolling: { status: "ok" as const, percent: 0, resetsAt: "2026-09-15T08:00:00.000Z" },
+          weekly: { status: "ok" as const, percent: 0, resetsAt: "2026-09-20T00:00:00.000Z" },
+          monthly: { status: "ok" as const, percent: 0, resetsAt: "2026-10-01T00:00:00.000Z" },
+        },
+      },
+    ]
+    const report = formatUsageReport(rows)
+
+    expect(report).toContain("   5-hour   188.5% left")
+    expect(report).toContain("   weekly   100% left")
+    expect(report).toContain("   monthly  200% left")
+    expect(formatAggregateUsage(rows).title).toBe(
+      "Aggregate  5-hour 188.5% left \u00b7 weekly 100% left \u00b7 monthly 200% left",
+    )
+    expect(report).toContain("(60% left)")
+    expect(report).toContain("rate-limited")
+  })
+
+  it("shows no usage data when every stored account failed or is disabled", () => {
+    const rows = [
+      { kind: "disabled" as const, index: 0, account: mk("go_old_key_dead", false, "Old") },
+      {
+        kind: "error" as const,
+        index: 1,
+        account: mk("super-secret-key-zzzz", true, "Broken"),
+        error: "network error",
+      },
+    ]
+    const report = formatUsageReport(rows)
+    expect(formatAggregateUsage(rows)).toMatchObject({
+      value: "aggregate",
+      title: "Aggregate  no usage data",
+      message: "no usage data",
+    })
+
+    expect(report.startsWith([
+      "OpenCode Go usage",
+      "",
+      "Aggregate available",
+      "no usage data",
+      "",
+      "1. Old  [primary]  disabled (not queried)",
+    ].join("\n"))).toBe(true)
+    expect(report).toContain("2. Broken  [primary]  key ...zzzz  lookup failed")
+    expect(report).not.toContain("0% left")
+    expect(report).not.toContain("super-secret-key-zzzz")
+    expect(report).not.toContain("go_old_key_dead")
   })
 
   it("shows per-account lookup failures without a full key", () => {
@@ -381,6 +475,10 @@ describe("reportGoUsage", () => {
     })
     const fetch = async () => usageResponse()
     const report = await reportGoUsage({ fetch, timeoutMs: 1_000 })
+    expect(report).toContain("Aggregate available")
+    expect(report).toContain("   5-hour   88% left")
+    expect(report).toContain("   weekly   60% left")
+    expect(report).toContain("   monthly  10% left")
     expect(report).toContain("1. Work  [primary]  key ...x1ab  remaining")
     expect(report).toContain("disabled (not queried)")
     expect(report).not.toContain("stored-key-x1ab")

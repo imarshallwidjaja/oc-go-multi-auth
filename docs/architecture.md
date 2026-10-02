@@ -271,7 +271,7 @@ const plugin = {
 export default { ...plugin, server } // V1 1.18.29+ calls server()
 ```
 
-The adapters share only version-neutral account selection, persistence, rotating-fetch construction, and the usage report. V1's `loader` and **Add Go Account** authorize function use `authClient.auth.set()` and return V1 auth hooks. V1 also registers `command["go-usage"]` and fills `command.execute.before` with the report plus `noReply: true` so newer V1 hosts skip the LLM turn. V2 registers its key method through the integration editor, `/go-usage` through the command editor (posted with `session.synthetic`), and its package-local native transport through the catalog editor. Account listing, removal, status, and usage are implemented separately in `cli.ts`.
+The adapters share only version-neutral account selection, persistence, rotating-fetch construction, and the usage report. V1's `loader` and **Add Go Account** authorize function use `authClient.auth.set()` and return V1 auth hooks. V1 registers `/go-usage` through the separate `./tui` entrypoint so its callback displays the report directly without creating an agent turn. V2 registers its key method through the integration editor, `/go-usage` through the command editor (posted with `session.synthetic`), and its package-local native transport through the catalog editor. Account listing, removal, status, and usage are implemented separately in `cli.ts`.
 
 ---
 
@@ -316,7 +316,7 @@ Both files are created with `0o600` permissions (readable only by the owner) sin
 
 ## Plugin System Integration
 
-The package default-exports one object with both runtime contracts:
+The package default-exports one object with both server runtime contracts:
 
 ```ts
 export default {
@@ -335,7 +335,7 @@ The returned V1 `Hooks.auth` object has:
 - `loader(getAuth) -> { apiKey, fetch }` — called at session start
 - `methods: AuthMethod[]` — available to the user via command palette
 
-The V1 auth methods use `type: "api"` for credential-based actions. V2 calls `setup()` and does not expose those methods, so V2 account management uses the `oc-go-multi-auth` CLI. Both adapters expose `/go-usage` (V1 via `config.command` + `command.execute.before`, V2 via `command.transform` + `session.synthetic`). The shared default export only packages both implementations together; it does not translate hooks or client calls between APIs.
+The V1 auth methods use `type: "api"` for credential-based actions. V2 calls `setup()` and does not expose those methods, so V2 account management uses the `oc-go-multi-auth` CLI. Both adapters expose `/go-usage` (V1 via the package's `./tui` entrypoint, V2 via `command.transform` + `session.synthetic`). OpenCode V1 loads server and TUI plugins independently, so the TUI entrypoint lives in `tui.ts` rather than the shared default export. OpenCode V2 detects the same package subpath as an optional V2 TUI plugin, so that module also provides an empty V2 `setup()`; V2 keeps the command implementation registered by the server plugin.
 
 ---
 

@@ -181,11 +181,11 @@ export function accountHasRemaining(payload: UsagePayload) {
 }
 
 export function accountLabel(account: GoAccount, index: number) {
-  return account.label || `Account ${index + 1}`
+  return account.label?.replace(/\s+/g, " ").trim() || `Account ${index + 1}`
 }
 
 export function maskApiKey(apiKey: string) {
-  return `...${apiKey.slice(-4)}`
+  return apiKey.length < 8 ? "****" : `...${apiKey.slice(-4)}`
 }
 
 function errorForStatus(status: number) {
@@ -263,6 +263,10 @@ export async function collectAccountUsage(
   return rows
 }
 
+export function collectStoredAccountUsage(options: { fetch?: UsageFetch; timeoutMs?: number } = {}) {
+  return collectAccountUsage(loadAccounts().accounts, options)
+}
+
 function formatReset(resetsAt: string) {
   const date = new Date(resetsAt)
   const year = date.getUTCFullYear()
@@ -284,7 +288,54 @@ function formatWindowRow(name: string, window: UsageWindow) {
   return `   ${name.padEnd(7)} ${usedText} used  ${leftText} ${window.status.padEnd(12)} resets ${formatReset(window.resetsAt)}`
 }
 
-function formatAccountRow(row: AccountUsageRow) {
+function formatPercentLeft(value: number) {
+  const rounded = Math.round(value * 10) / 10
+  const text = Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)
+  return `${text}% left`
+}
+
+function leftoverTotals(rows: AccountUsageRow[]) {
+  const totals = { rolling: 0, weekly: 0, monthly: 0 }
+  let sawOk = false
+  for (const row of rows) {
+    if (row.kind !== "ok") continue
+    sawOk = true
+    for (const key of ["rolling", "weekly", "monthly"] as const) {
+      const window = row.payload[key]
+      if (window.status !== "ok") continue
+      totals[key] += 100 - window.percent
+    }
+  }
+  return sawOk ? totals : null
+}
+
+const NO_USAGE_DATA = "no usage data"
+
+export function formatAggregateUsage(rows: AccountUsageRow[]) {
+  const totals = leftoverTotals(rows)
+  if (!totals) {
+    return {
+      value: "aggregate",
+      title: `Aggregate  ${NO_USAGE_DATA}`,
+      message: NO_USAGE_DATA,
+      block: `Aggregate available\n${NO_USAGE_DATA}`,
+    }
+  }
+  const windows = [
+    ["5-hour", formatPercentLeft(totals.rolling)],
+    ["weekly", formatPercentLeft(totals.weekly)],
+    ["monthly", formatPercentLeft(totals.monthly)],
+  ] as const
+  const message = windows.map(([label, text]) => `   ${label.padEnd(9)}${text}`).join("\n")
+  return {
+    value: "aggregate",
+    title: `Aggregate  ${windows.map(([label, text]) => `${label} ${text}`).join(" \u00b7 ")}`,
+    message,
+    block: `Aggregate available\n${message}`,
+  }
+}
+
+export function formatAccountRow(row: AccountUsageRow) {
   const label = accountLabel(row.account, row.index)
   const prefix = `${row.index + 1}. ${label}  [${row.account.role}]`
   if (row.kind === "disabled") {
@@ -308,10 +359,11 @@ function formatAccountRow(row: AccountUsageRow) {
 
 export function formatUsageReport(rows: AccountUsageRow[]) {
   if (rows.length === 0) return `OpenCode Go usage\n\n${EMPTY_USAGE_MESSAGE}`
-  return `OpenCode Go usage\n\n${rows.map(formatAccountRow).join("\n\n")}`
+  const accounts = rows.map(formatAccountRow).join("\n\n")
+  return `OpenCode Go usage\n\n${formatAggregateUsage(rows).block}\n\n${accounts}`
 }
 
 export async function reportGoUsage(options: { fetch?: UsageFetch; timeoutMs?: number } = {}) {
-  const rows = await collectAccountUsage(loadAccounts().accounts, options)
+  const rows = await collectStoredAccountUsage(options)
   return formatUsageReport(rows)
 }

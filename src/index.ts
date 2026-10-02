@@ -89,36 +89,8 @@ function parseOptionalRole(value: unknown): AccountRole | null {
   return parseAccountRole(value)
 }
 
-type V1CommandConfig = {
-  template: string
-  description?: string
-  agent?: string
-  model?: string
-  subtask?: boolean
-}
-
-type V1CommandExecuteOutput = {
-  parts: Array<{ type: "text"; text: string }>
-  noReply?: boolean
-}
-
 function createV1Hooks(setAuth: (key: string) => Promise<void>): Hooks {
   return {
-    async config(input) {
-      const commands: Record<string, V1CommandConfig> = { ...input.command }
-      commands[GO_USAGE_COMMAND] = {
-        template: "OpenCode Go usage",
-        description: GO_USAGE_DESCRIPTION,
-      }
-      input.command = commands
-    },
-    async "command.execute.before"(input, output) {
-      if (input.command !== GO_USAGE_COMMAND) return
-      const text = await reportGoUsage()
-      const commandOutput = output as V1CommandExecuteOutput
-      commandOutput.parts = [{ type: "text", text }]
-      commandOutput.noReply = true
-    },
     auth: {
       provider: PROVIDER_ID,
       async loader() {

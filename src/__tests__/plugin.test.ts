@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "bun:test"
-import { mkdtempSync, rmSync } from "fs"
+import { mkdtempSync, readFileSync, rmSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
 import type { Plugin as V1Plugin } from "@opencode-ai/plugin"
@@ -8,6 +8,7 @@ import { loadAccounts, loadRotationState, saveAccounts, saveRotationState } from
 const originalHome = process.env.HOME
 let tmpHome: string
 let plugin: typeof import("../index").default
+let tuiPlugin: typeof import("../tui").default
 
 function pluginInput(client: unknown): Parameters<V1Plugin>[0] {
   return {
@@ -262,6 +263,7 @@ beforeAll(async () => {
   tmpHome = mkdtempSync(join(tmpdir(), "go-plugin-test-"))
   process.env.HOME = tmpHome
   plugin = (await import("../index")).default
+  tuiPlugin = (await import("../tui")).default
 })
 
 beforeEach(() => {
@@ -447,15 +449,31 @@ describe("OpenCode V1 adapter", () => {
     }
   })
 
-  it("registers config.command[\"go-usage\"] and command.execute.before writes the report and sets noReply", async () => {
+  it("does not register go-usage as a prompt command", async () => {
+    const client = { auth: { set: async () => authSetSuccess() } }
+    const hooks = await plugin.server(pluginInput(client))
+    const config: { command?: Record<string, { template: string; description?: string }> } = {}
+
+    await hooks.config?.(config as any)
+
+    expect(config.command?.["go-usage"]).toBeUndefined()
+    expect(hooks["command.execute.before"]).toBeUndefined()
+  })
+})
+
+describe("OpenCode V1 TUI adapter", () => {
+  it("registers go-usage as a direct TUI command without invoking a session command", async () => {
+    const apiKey = "secret-key-x1ab"
     saveAccounts({
       version: 1,
-      accounts: [{ apiKey: "secret-key-x1ab", label: "Work", addedAt: 10, enabled: true, role: "primary" }],
+      accounts: [{ apiKey, label: "Work", addedAt: 10, enabled: true, role: "primary" }],
       rotationIndex: 0,
     })
     const originalFetch = globalThis.fetch
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
-      expect(String(input instanceof Request ? input.url : input)).toBe("https://opencode.ai/zen/go/v1/usage")
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init)
+      expect(request.url).toBe("https://opencode.ai/zen/go/v1/usage")
+      expect(request.headers.get("Authorization")).toBe(`Bearer ${apiKey}`)
       return Response.json({
         usage: {
           rolling: { status: "ok", percent: 12, resetsAt: "2026-09-15T08:00:00.000Z" },
@@ -464,32 +482,296 @@ describe("OpenCode V1 adapter", () => {
         },
       })
     }) as typeof fetch
+    let layer: any
+    let dialogRenders = 0
+    let dialogSize = "medium"
+    let select: unknown
+    let alert: unknown
+    const dialogCalls: string[] = []
+    const toastCalls: unknown[] = []
+    let sessionCalls = 0
+    const api = {
+      client: {
+        session: {
+          command() { sessionCalls++ },
+          prompt() { sessionCalls++ },
+        },
+      },
+      keymap: {
+        registerLayer(value: unknown) {
+          layer = value
+          return () => {}
+        },
+      },
+      ui: {
+        toast(input: unknown) { toastCalls.push(input) },
+        DialogAlert(input: unknown) {
+          alert = input
+          return input
+        },
+        DialogSelect(input: unknown) {
+          select = input
+          return input
+        },
+        dialog: {
+          setSize(size: string) {
+            dialogCalls.push("setSize")
+            dialogSize = size
+          },
+          replace(render: () => unknown) {
+            expect(render).toBeFunction()
+            dialogCalls.push("replace")
+            // OpenCode 1.18.30 resets the stack size during replace.
+            dialogSize = "medium"
+            dialogRenders++
+            render()
+          },
+        },
+      },
+    }
+
+    await tuiPlugin.tui(api as any, undefined, {} as any)
+
+    expect(tuiPlugin.id).toBe("oc-go-multi-auth")
+    expect("server" in tuiPlugin).toBe(false)
+    expect(tuiPlugin.setup).toBeFunction()
+    await expect(tuiPlugin.setup()).resolves.toBeUndefined()
+    expect(layer.commands).toHaveLength(1)
+    expect(layer.commands[0]).toMatchObject({
+      name: "go-usage",
+      slashName: "go-usage",
+      namespace: "palette",
+    })
 
     try {
-      const client = { auth: { set: async () => authSetSuccess() } }
-      const hooks = await plugin.server(pluginInput(client))
-      const config: { command?: Record<string, { template: string; description?: string }> } = {}
-      await hooks.config!(config as any)
-
-      expect(config.command?.["go-usage"]).toEqual({
-        template: "OpenCode Go usage",
-        description: "Show remaining OpenCode Go quota for stored accounts",
-      })
-
-      const output: { parts: Array<{ type: string; text: string }>; noReply?: boolean } = { parts: [] }
-      await hooks["command.execute.before"]!(
-        { command: "go-usage", sessionID: "sess-1", arguments: "" },
-        output as any,
-      )
-
-      expect(output.noReply).toBe(true)
-      expect(output.parts[0]?.type).toBe("text")
-      expect(output.parts[0]?.text).toContain("1. Work  [primary]  key ...x1ab  remaining")
-      expect(output.parts[0]?.text).toContain("12% used")
-      expect(output.parts[0]?.text).not.toContain("secret-key-x1ab")
+      await layer.commands[0].run()
     } finally {
       globalThis.fetch = originalFetch
     }
+
+    expect(toastCalls).toEqual([{
+      variant: "info",
+      message: "Loading OpenCode Go usage...",
+      duration: 2_000,
+    }])
+    expect(dialogCalls).toEqual(["replace", "setSize"])
+    expect(dialogSize).toBe("xlarge")
+    expect(dialogRenders).toBe(1)
+    const renderedSelect = select as {
+      title: string
+      placeholder: string
+      options: Array<{ title: string; value: string }>
+      onSelect(option: { title: string; value: string }): void
+    }
+    expect(renderedSelect.title).toContain("Up/Down, PgUp/PgDn, Home/End")
+    expect(renderedSelect.title).toContain("Esc close")
+    expect(renderedSelect.placeholder).toBe("Filter accounts")
+    expect(renderedSelect.options).toHaveLength(2)
+    expect(renderedSelect.options[0]).toEqual({
+      title: "Aggregate  5-hour 88% left \u00b7 weekly 60% left \u00b7 monthly 10% left",
+      value: "aggregate",
+    })
+    expect(renderedSelect.options[1]?.title).toContain("1. Work  [primary]  key ...x1ab  remaining")
+    expect(renderedSelect.options[1]?.value).toBe("0")
+    const initialOptions = renderedSelect.options.map((option) => ({ ...option }))
+
+    renderedSelect.onSelect(renderedSelect.options[0]!)
+    const aggregateAlert = alert as { title: string; message: string; onConfirm(): void }
+    expect(aggregateAlert.message).toBe([
+      "   5-hour   88% left",
+      "   weekly   60% left",
+      "   monthly  10% left",
+    ].join("\n"))
+
+    renderedSelect.onSelect(renderedSelect.options[1]!)
+    const renderedAlert = alert as { title: string; message: string; onConfirm(): void }
+    expect(renderedAlert.title).toContain("Enter back; Esc close")
+    expect(renderedAlert.message).toContain("12% used")
+    expect(renderedAlert.message).toMatch(/^5-hour/)
+    expect(sessionCalls).toBe(0)
+
+    renderedAlert.onConfirm()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(dialogRenders).toBe(4)
+    const reopenedSelect = select as typeof renderedSelect
+    expect(reopenedSelect.options).toEqual(initialOptions)
+  })
+
+  it("gives accounts with identical details distinct selector identities", async () => {
+    saveAccounts({
+      version: 1,
+      accounts: [
+        { apiKey: "secret-key-aaaa", label: "First", addedAt: 10, enabled: true, role: "primary" },
+        { apiKey: "secret-key-bbbb", label: "Second", addedAt: 20, enabled: true, role: "primary" },
+      ],
+      rotationIndex: 0,
+    })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => Response.json({
+      usage: {
+        rolling: { status: "ok", percent: 12, resetsAt: "2026-09-15T08:00:00.000Z" },
+        weekly: { status: "ok", percent: 40, resetsAt: "2026-09-20T00:00:00.000Z" },
+        monthly: { status: "ok", percent: 90, resetsAt: "2026-10-01T00:00:00.000Z" },
+      },
+    })) as typeof fetch
+    let layer: any
+    let select: any
+    let alert: any
+
+    await tuiPlugin.tui({
+      keymap: { registerLayer(value: unknown) { layer = value; return () => {} } },
+      ui: {
+        toast() {},
+        DialogSelect(input: unknown) { select = input; return input },
+        DialogAlert(input: unknown) { alert = input; return input },
+        dialog: { replace(render: () => unknown) { render() }, setSize() {} },
+      },
+    } as any, undefined, {} as any)
+
+    try {
+      await layer.commands[0].run()
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+
+    expect(select.options).toHaveLength(3)
+    expect(select.options[0].value).toBe("aggregate")
+    expect(select.options[0].title).toBe("Aggregate  5-hour 176% left \u00b7 weekly 120% left \u00b7 monthly 20% left")
+    const [, first, second] = select.options
+    expect(first.value).not.toBe(second.value)
+    expect(select.options.filter((option: { value: string }) => option.value === first.value)).toHaveLength(1)
+    expect(select.options.filter((option: { value: string }) => option.value === second.value)).toHaveLength(1)
+
+    select.onSelect(first)
+    expect(alert.title).toContain("1. First")
+    const firstDetails = alert.message
+    select.onSelect(second)
+    expect(alert.title).toContain("2. Second")
+    expect(alert.message).toBe(firstDetails)
+    expect(alert.message).toContain("12% used")
+  })
+
+  it("makes every account reachable through the host selector in a bounded terminal", async () => {
+    const accounts = Array.from({ length: 20 }, (_, index) => ({
+      apiKey: `secret-key-${String(index + 1).padStart(4, "0")}`,
+      label: index === 9 ? "Account 10\n\nInjected option" : `Account ${index + 1}`,
+      addedAt: index,
+      enabled: true,
+      role: "primary" as const,
+    }))
+    saveAccounts({ version: 1, accounts, rotationIndex: 0 })
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => Response.json({
+      usage: {
+        rolling: { status: "ok", percent: 12, resetsAt: "2026-09-15T08:00:00.000Z" },
+        weekly: { status: "ok", percent: 40, resetsAt: "2026-09-20T00:00:00.000Z" },
+        monthly: { status: "ok", percent: 90, resetsAt: "2026-10-01T00:00:00.000Z" },
+      },
+    })) as typeof fetch
+    let layer: any
+    let select: any
+    let alert: any
+    let sessionCalls = 0
+
+    await tuiPlugin.tui({
+      client: { session: { command() { sessionCalls++ }, prompt() { sessionCalls++ } } },
+      keymap: { registerLayer(value: unknown) { layer = value; return () => {} } },
+      ui: {
+        toast() {},
+        DialogSelect(input: unknown) { select = input; return input },
+        DialogAlert(input: unknown) { alert = input; return input },
+        dialog: { replace(render: () => unknown) { render() }, setSize() {} },
+      },
+    } as any, undefined, {} as any)
+
+    try {
+      await layer.commands[0].run()
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+
+    expect(select.options).toHaveLength(21)
+    expect(select.options.map((option: { title: string }) => option.title)).toEqual([
+      "Aggregate  5-hour 1760% left \u00b7 weekly 1200% left \u00b7 monthly 200% left",
+      ...accounts.map((account, index) => `${index + 1}. ${account.label.replace(/\s+/g, " ")}  [primary]  key ...${account.apiKey.slice(-4)}  remaining`),
+    ])
+    expect(select.options[0].value).toBe("aggregate")
+    expect(select.options.slice(1).map((option: { value: string }) => option.value)).toEqual(
+      accounts.map((_, index) => String(index)),
+    )
+    expect(select.options[10].title).toContain("Account 10 Injected option")
+    expect(JSON.stringify(select.options)).not.toContain("secret-key-")
+    select.onSelect(select.options[0])
+    expect(alert.message).toContain("1760% left")
+    expect(alert.message).not.toContain("secret-key-")
+    select.onSelect(select.options[20])
+    expect(alert.title).toContain("20. Account 20")
+    expect(alert.message).toContain("5-hour")
+    expect(alert.message).toContain("monthly")
+    expect(sessionCalls).toBe(0)
+  })
+
+  it("opens the empty message directly without a selectable account or session call", async () => {
+    let layer: any
+    let selectCalls = 0
+    let alert: any
+    let sessionCalls = 0
+
+    await tuiPlugin.tui({
+      client: { session: { command() { sessionCalls++ }, prompt() { sessionCalls++ } } },
+      keymap: { registerLayer(value: unknown) { layer = value; return () => {} } },
+      ui: {
+        toast() {},
+        DialogSelect() { selectCalls++; return undefined },
+        DialogAlert(input: unknown) { alert = input; return input },
+        dialog: { replace(render: () => unknown) { render() }, setSize() {} },
+      },
+    } as any, undefined, {} as any)
+
+    await layer.commands[0].run()
+
+    expect(selectCalls).toBe(0)
+    expect(alert).toMatchObject({ message: "No Go accounts configured." })
+    expect(sessionCalls).toBe(0)
+  })
+
+  it("shows an error toast when the usage command fails", async () => {
+    let layer: any
+    const toastCalls: unknown[] = []
+
+    await tuiPlugin.tui({
+      keymap: {
+        registerLayer(value: unknown) {
+          layer = value
+          return () => {}
+        },
+      },
+      ui: {
+        toast(input: unknown) { toastCalls.push(input) },
+        dialog: {
+          replace() { throw new Error("dialog unavailable") },
+          setSize() {},
+          clear() {},
+        },
+      },
+    } as any, undefined, {} as any)
+
+    await expect(layer.commands[0].run()).resolves.toBeUndefined()
+    const log = readFileSync(join(tmpHome, ".config", "opencode", "oc-go-multi-auth.log"), "utf-8")
+    expect(log).toContain('"msg":"usage report failed"')
+    expect(log).toContain('"error":"dialog unavailable"')
+    expect(toastCalls).toEqual([
+      {
+        variant: "info",
+        message: "Loading OpenCode Go usage...",
+        duration: 2_000,
+      },
+      {
+        variant: "error",
+        message: "Failed to load OpenCode Go usage.",
+      },
+    ])
   })
 })
 
@@ -724,6 +1006,10 @@ describe("OpenCode V2 adapter", () => {
 
       expect(harness.synthetics).toHaveLength(1)
       expect(harness.synthetics[0].sessionID).toBe("sess-1")
+      expect(harness.synthetics[0].text).toContain("Aggregate available")
+      expect(harness.synthetics[0].text).toContain("   5-hour   88% left")
+      expect(harness.synthetics[0].text).toContain("   weekly   60% left")
+      expect(harness.synthetics[0].text).toContain("   monthly  10% left")
       expect(harness.synthetics[0].text).toContain("1. Work  [primary]  key ...x1ab  remaining")
       expect(JSON.stringify(harness.synthetics)).not.toContain("secret-key-x1ab")
     } finally {
