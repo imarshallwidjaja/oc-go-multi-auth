@@ -26,7 +26,7 @@ The package source contains separate OpenCode V1 and V2 adapters. OpenCode V1 1.
 
 ## Source Setup
 
-`oc-go-multi-auth` is not published to npm yet. Clone and build the current source for development and verification:
+Clone and build the current source for development and verification:
 
 ```sh
 git clone https://github.com/imarshallwidjaja/oc-go-multi-auth
@@ -39,7 +39,7 @@ You can run the account CLI from the checkout with `bun run src/cli.ts`. Do not 
 
 ## Registry Installation
 
-After the package is published, install it globally:
+Install the published [npm package](https://www.npmjs.com/package/oc-go-multi-auth) globally:
 
 ```sh
 bun add --global oc-go-multi-auth
