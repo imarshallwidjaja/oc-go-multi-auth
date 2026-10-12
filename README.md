@@ -75,7 +75,7 @@ The global package install exposes the `oc-go-multi-auth` account-management CLI
 
 **Prerequisites:**
 - [OpenCode](https://opencode.ai) 1.18.29 through 1.x, or 2.0.2 through 2.0.x (V2.0.0, V2.0.1, and V2.1+ are not supported)
-- [Bun](https://bun.sh) 1.x (for local development)
+- [Bun](https://bun.sh) 1.x on your `PATH`: the `oc-go-multi-auth` CLI starts with `#!/usr/bin/env bun`, so it needs Bun even when installed with npm. Bun is also required for local development. The package is verified with Bun 1.4.2.
 - One or more Go API keys from [opencode.ai/auth](https://opencode.ai/auth)
 
 ---
@@ -191,7 +191,10 @@ bun install
 bun test       # unit tests
 bun run build  # builds declarations and the V1/V2 package entrypoints
 bun run typecheck  # tsc --noEmit
+node scripts/verify-package.mjs  # build, pack, and smoke-test the installed tarball
 ```
+
+Maintainers publishing to npm: see [docs/publishing.md](./docs/publishing.md).
 
 ---
 
@@ -215,4 +218,4 @@ See [docs/architecture.md](./docs/architecture.md) for the full breakdown.
 
 ## License
 
-MIT
+MIT. See [LICENSE](./LICENSE).

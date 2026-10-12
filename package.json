@@ -29,6 +29,7 @@
   "files": [
     "dist",
     "README.md",
+    "LICENSE",
     "package.json"
   ],
   "scripts": {
@@ -52,6 +53,10 @@
   "homepage": "https://github.com/imarshallwidjaja/oc-go-multi-auth",
   "bugs": {
     "url": "https://github.com/imarshallwidjaja/oc-go-multi-auth/issues"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
   },
   "engines": {
     "opencode": ">=1.18.29 <2 || >=2.0.2 <2.1"

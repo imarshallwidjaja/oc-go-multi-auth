@@ -1,0 +1,165 @@
+name: Publish
+
+# Manual only. npm trusted publishing is bound to this file name
+# ("publish.yml"), so renaming it requires updating the trusted publisher on npmjs.com.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and verify only. Clear this box to publish the selected tag to npm.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# Never cancel a run that may be publishing; queue the next one instead.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  # Unprivileged: no id-token, runs repository code, and produces the one
+  # verified tarball that the publish job uploads.
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      tarball: ${{ steps.package.outputs.tarball }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      # Full history so the tag can be checked against origin/main.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check ref and version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          case "$REF_TYPE" in
+            tag)
+              if [ "$REF_NAME" != "v$version" ]; then
+                echo "::error::Tag $REF_NAME does not match package.json version, expected v$version."
+                exit 1
+              fi
+              if ! git rev-parse --verify --quiet refs/remotes/origin/main > /dev/null; then
+                echo "::error::origin/main is not available to check tag $REF_NAME against."
+                exit 1
+              fi
+              if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+                echo "::error::Tag $REF_NAME points to a commit that is not on main."
+                exit 1
+              fi
+              ;;
+            branch)
+              if [ "$DRY_RUN" != "true" ]; then
+                echo "::error::Publishing requires the tag v$version. This run is on branch $REF_NAME."
+                exit 1
+              fi
+              if [ "$REF_NAME" != "main" ]; then
+                echo "::error::Dry runs are allowed on main or on a release tag, not on branch $REF_NAME."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::Unsupported ref type: $REF_TYPE."
+              exit 1
+              ;;
+          esac
+          echo "Ref $REF_TYPE $REF_NAME, package version $version, dry_run=$DRY_RUN."
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.2
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Check npm version
+        run: |
+          version="$(npm --version)"
+          printf '%s\n' 11.5.1 "$version" | sort -V -C || { echo "::error::npm $version is older than 11.5.1"; exit 1; }
+
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+
+      # Builds, packs once, and smoke-tests the installed archive. The script
+      # prints the path of the verified tarball, the one file to publish.
+      - name: Build and verify package
+        id: package
+        run: |
+          set -euo pipefail
+          tarball="$(node scripts/verify-package.mjs --out "$RUNNER_TEMP/package")"
+          sha256="$(sha256sum "$tarball" | cut -d ' ' -f 1)"
+          {
+            echo "tarball=$(basename "$tarball")"
+            echo "sha256=$sha256"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Verified package"
+            echo
+            echo "- File: \`$(basename "$tarball")\`"
+            echo "- SHA-256: \`$sha256\`"
+            echo "- Ref: \`$GITHUB_REF\` at \`$GITHUB_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Uploaded on dry runs too, so the verified tarball can be downloaded for
+      # the first manual publication.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: package-tarball
+          path: ${{ runner.temp }}/package/${{ steps.package.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # Privileged: the only job with id-token. It runs no repository code and
+  # publishes only the tarball that prepare verified.
+  publish:
+    needs: prepare
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Check npm version
+        run: |
+          version="$(npm --version)"
+          printf '%s\n' 11.5.1 "$version" | sort -V -C || { echo "::error::npm $version is older than 11.5.1"; exit 1; }
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: package-tarball
+          path: ${{ runner.temp }}/package
+
+      # No NPM_TOKEN: npm exchanges the GitHub OIDC token for a short-lived
+      # publish credential. Publishing a version that already exists fails.
+      - name: Publish verified tarball
+        env:
+          TARBALL: ${{ needs.prepare.outputs.tarball }}
+          SHA256: ${{ needs.prepare.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/package"
+          if [ "$(ls -A | wc -l)" -ne 1 ] || [ ! -f "$TARBALL" ]; then
+            echo "::error::Expected exactly one file, $TARBALL, in the downloaded artifact."
+            exit 1
+          fi
+          echo "$SHA256  $TARBALL" | sha256sum --check --strict
+          npm publish "./$TARBALL" --access public --provenance
