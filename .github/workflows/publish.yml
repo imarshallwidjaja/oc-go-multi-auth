@@ -162,4 +162,4 @@ jobs:
             exit 1
           fi
           echo "$SHA256  $TARBALL" | sha256sum --check --strict
-          npm publish "./$TARBALL" --access public --provenance
+          npm publish "./$TARBALL" --access public --provenance --loglevel verbose
