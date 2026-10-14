@@ -1,8 +1,20 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test"
-import { mkdtempSync, writeFileSync, mkdirSync, readdirSync, rmSync } from "fs"
+import { mkdtempSync, writeFileSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
-import { loadAccounts, saveAccounts, loadRotationState, saveRotationState } from "../storage"
+import { AccountInputError, addAccount, removeAccount, setAccountRole } from "../accounts"
+import {
+  accountId,
+  accountsPath,
+  AccountsBusyError,
+  AccountsCorruptError,
+  loadAccounts,
+  loadRotationState,
+  resolveLastUsedIndex,
+  saveAccounts,
+  saveRotationState,
+  updateAccounts,
+} from "../storage"
 
 // storage.ts calls homedir() dynamically, so overriding HOME before each test works
 const origHome = process.env.HOME
@@ -120,5 +132,101 @@ describe("storage", () => {
     )
 
     expect(loadAccounts().rotationIndex).toBe(0)
+  })
+})
+
+describe("account edits", () => {
+  const account = (apiKey: string, addedAt: number) => ({ apiKey, addedAt, enabled: true, role: "primary" as const })
+  const configDir = () => join(tmpHome, ".config", "opencode")
+
+  it("serializes concurrent edits so none is lost", async () => {
+    await Promise.all(Array.from({ length: 12 }, (_, index) => addAccount({ apiKey: `key-${index}` })))
+    expect(loadAccounts().accounts.map((a) => a.apiKey).sort()).toEqual(
+      Array.from({ length: 12 }, (_, index) => `key-${index}`).sort(),
+    )
+    expect(readdirSync(configDir()).filter((f) => f.includes(".tmp.") || f.endsWith(".lock"))).toEqual([])
+  })
+
+  it("writes the account file with owner-only permissions", async () => {
+    await addAccount({ apiKey: "key-a" })
+    expect(statSync(accountsPath()).mode & 0o777).toBe(0o600)
+  })
+
+  it("fails with a busy error while another edit holds the lock, and never breaks the lock", async () => {
+    mkdirSync(configDir(), { recursive: true })
+    writeFileSync(`${accountsPath()}.lock`, "{}")
+    await expect(updateAccounts(() => {}, { timeoutMs: 60 })).rejects.toBeInstanceOf(AccountsBusyError)
+    expect(readdirSync(configDir())).toContain("opencode-go-accounts.json.lock")
+  })
+
+  it("refuses to edit a corrupt file instead of replacing it with an empty list", async () => {
+    mkdirSync(configDir(), { recursive: true })
+    writeFileSync(accountsPath(), "{not json")
+    await expect(addAccount({ apiKey: "key-secret-1" })).rejects.toBeInstanceOf(AccountsCorruptError)
+    const invalid = JSON.stringify({ version: 1, accounts: "nope" })
+    writeFileSync(accountsPath(), invalid)
+    await expect(setAccountRole({ number: 1 }, "primary")).rejects.toBeInstanceOf(AccountsCorruptError)
+    expect(readFileSync(accountsPath(), "utf-8")).toBe(invalid)
+    expect(readdirSync(configDir()).filter((f) => f.endsWith(".lock"))).toEqual([])
+  })
+
+  it("aborts without writing when the edit throws", async () => {
+    saveAccounts({ version: 1, accounts: [account("key-a", 1)], rotationIndex: 0 })
+    const before = readFileSync(accountsPath(), "utf-8")
+    await expect(updateAccounts((data) => {
+      data.accounts.length = 0
+      throw new Error("rejected")
+    })).rejects.toThrow("rejected")
+    expect(readFileSync(accountsPath(), "utf-8")).toBe(before)
+  })
+
+  it("keeps account ids unique when one key is added twice in the same millisecond", async () => {
+    const realNow = Date.now
+    Date.now = () => 5_000
+    try {
+      const first = await addAccount({ apiKey: "duplicate-key-1111", label: "first" })
+      const second = await addAccount({ apiKey: "duplicate-key-1111", label: "second" })
+      await addAccount({ apiKey: "other-key-2222", label: "other" })
+      expect(second.account.id).not.toBe(first.account.id)
+      expect(loadAccounts().accounts.map((a) => a.addedAt)).toEqual([5_000, 5_001, 5_000])
+
+      await setAccountRole({ id: second.account.id }, "overage_fallback")
+      expect(loadAccounts().accounts.map((a) => [a.label, a.role])).toEqual([
+        ["first", "primary"],
+        ["second", "overage_fallback"],
+        ["other", "primary"],
+      ])
+      await removeAccount({ id: second.account.id })
+      expect(loadAccounts().accounts.map((a) => a.label)).toEqual(["first", "other"])
+    } finally {
+      Date.now = realNow
+    }
+  })
+
+  it("rejects an id shared by accounts from an older file instead of editing the first match", async () => {
+    saveAccounts({
+      version: 1,
+      accounts: [
+        { ...account("key-a", 1), label: "first" },
+        { ...account("key-a", 1), label: "second" },
+      ],
+      rotationIndex: 0,
+    })
+    const before = readFileSync(accountsPath(), "utf-8")
+    const id = accountId(account("key-a", 1))
+    await expect(setAccountRole({ id }, "overage_fallback")).rejects.toBeInstanceOf(AccountInputError)
+    await expect(removeAccount({ id })).rejects.toThrow("Several accounts share")
+    expect(readFileSync(accountsPath(), "utf-8")).toBe(before)
+
+    await setAccountRole({ number: 2 }, "overage_fallback")
+    expect(loadAccounts().accounts.map((a) => a.role)).toEqual(["primary", "overage_fallback"])
+  })
+
+  it("resolves the last-used account by identity before the legacy index", () => {
+    const accounts = [account("key-a", 1), account("key-b", 2)]
+    expect(accountId(accounts[0])).toMatch(/^[0-9a-f]{16}$/)
+    expect(resolveLastUsedIndex(accounts, { lastUsedIndex: 0, lastUsedAccount: accountId(accounts[1]) })).toBe(1)
+    expect(resolveLastUsedIndex(accounts, { lastUsedIndex: 1, lastUsedAccount: "gone" })).toBe(1)
+    expect(resolveLastUsedIndex(accounts, { lastUsedIndex: 7 })).toBe(-1)
   })
 })

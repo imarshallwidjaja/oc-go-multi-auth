@@ -57,6 +57,8 @@ function checkArchiveContents(pkg, files) {
   for (const path of declaredPaths(pkg)) assert.ok(present.has(path), `package.json declares ${path} but the archive does not contain it`)
   const unexpected = files.filter((path) => !ROOT_FILES.has(path) && !/^dist\/[^/]+\.(js|d\.ts)$/.test(path))
   assert.deepEqual(unexpected, [], `archive contains files outside the public allowlist: ${unexpected.join(", ")}`)
+  const retired = files.filter((path) => path.includes("v2-provider"))
+  assert.deepEqual(retired, [], `archive contains retired native-provider output: ${retired.join(", ")}`)
 }
 
 // The install smoke test cannot catch an undeclared dependency that npm happens
@@ -80,16 +82,17 @@ const SMOKE_SCRIPT = `
 import assert from "node:assert/strict"
 import plugin from "oc-go-multi-auth"
 import tui from "oc-go-multi-auth/tui"
-import * as provider from "oc-go-multi-auth/v2/provider"
+import { GoAccountsRpc } from "oc-go-multi-auth/rpc"
 
 assert.equal(typeof plugin.id, "string")
 assert.equal(typeof plugin.setup, "function", "root export must expose the V2 setup()")
 assert.equal(typeof plugin.server, "function", "root export must expose the V1 server()")
 assert.equal(typeof tui.id, "string")
-assert.equal(typeof tui.tui, "function", "./tui export must expose tui()")
-assert.equal(typeof provider.model, "function", "./v2/provider must export model()")
-assert.equal(typeof provider.createRotatingMiddleware, "function")
-assert.equal(typeof provider.NATIVE_PACKAGE_SETTING, "string")
+assert.equal(typeof tui.tui, "function", "./tui export must expose the V1 tui()")
+assert.equal(typeof tui.setup, "function", "./tui export must expose the V2 setup()")
+assert.equal(GoAccountsRpc.id, "oc-go-multi-auth")
+assert.deepEqual(Object.keys(GoAccountsRpc.methods).sort(), ["add", "list", "remove", "setRole", "usage"])
+await assert.rejects(import("oc-go-multi-auth/v2/provider"), "the retired ./v2/provider export must stay unpublished")
 `
 
 // Installs the archive into an empty project outside the checkout, so only the
@@ -114,7 +117,7 @@ function smokeInstall(pkg, tarball) {
 
     writeFileSync(join(project, "smoke.mjs"), SMOKE_SCRIPT)
     for (const runtime of ["node", "bun"]) {
-      log(`importing root, ./tui and ./v2/provider under ${runtime}`)
+      log(`importing root, ./tui and ./rpc without OpenCode peers under ${runtime}`)
       run(runtime, ["smoke.mjs"], { cwd: project, env })
     }
 

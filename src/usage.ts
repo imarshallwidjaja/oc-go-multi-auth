@@ -1,6 +1,6 @@
 import { USAGE_URL } from "./opencode.js"
 import { loadAccounts } from "./storage.js"
-import type { GoAccount } from "./types.js"
+import type { AccountRole, GoAccount } from "./types.js"
 
 export const MAX_USAGE_BODY_BYTES = 8 * 1024
 export const USAGE_COMMAND_TIMEOUT_MS = 8_000
@@ -29,10 +29,16 @@ export type BoundedJsonResult =
   | { ok: true; value: unknown }
   | { ok: false; reason: "oversized" | "aborted" | "invalid-json" | "unavailable" }
 
+/** Display-safe account fields: the key appears only as a masked hint. */
+export interface UsageAccount {
+  label?: string
+  role: AccountRole
+}
+
 export type AccountUsageRow =
-  | { kind: "disabled"; index: number; account: GoAccount }
-  | { kind: "ok"; index: number; account: GoAccount; payload: UsagePayload }
-  | { kind: "error"; index: number; account: GoAccount; error: string }
+  | { kind: "disabled"; index: number; account: UsageAccount }
+  | { kind: "ok"; index: number; account: UsageAccount; keyHint: string; payload: UsagePayload }
+  | { kind: "error"; index: number; account: UsageAccount; keyHint: string; error: string }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -180,7 +186,7 @@ export function accountHasRemaining(payload: UsagePayload) {
     && payload.monthly.status === "ok"
 }
 
-export function accountLabel(account: GoAccount, index: number) {
+export function accountLabel(account: Pick<GoAccount, "label">, index: number) {
   return account.label?.replace(/\s+/g, " ").trim() || `Account ${index + 1}`
 }
 
@@ -201,38 +207,49 @@ function errorForBounded(reason: Exclude<BoundedJsonResult, { ok: true }>["reaso
 }
 
 async function queryAccountUsage(
-  account: GoAccount,
+  { apiKey, label, role }: GoAccount,
   index: number,
   useFetch: UsageFetch,
   timeoutMs: number,
+  callerSignal?: AbortSignal,
 ): Promise<AccountUsageRow> {
+  const account: UsageAccount = { label, role }
+  const keyHint = maskApiKey(apiKey)
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | undefined
+  let stopWatching = () => {}
+  // Ends on the deadline, or at once when the caller (such as a closed dialog) goes away.
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
+    const expire = () => {
       controller.abort()
       reject(new DOMException("This operation was aborted", "AbortError"))
-    }, Math.max(0, timeoutMs))
+    }
+    timer = setTimeout(expire, Math.max(0, timeoutMs))
+    if (callerSignal) {
+      stopWatching = () => callerSignal.removeEventListener("abort", expire)
+      if (callerSignal.aborted) expire()
+      else callerSignal.addEventListener("abort", expire, { once: true })
+    }
   })
   const lookup = (async (): Promise<AccountUsageRow> => {
     const response = await useFetch(new Request(USAGE_URL, {
       method: "GET",
-      headers: { Authorization: `Bearer ${account.apiKey}` },
+      headers: { Authorization: `Bearer ${apiKey}` },
       signal: controller.signal,
     }))
     if (response.status !== 200) {
       discardResponse(response)
-      return { kind: "error", index, account, error: errorForStatus(response.status) }
+      return { kind: "error", index, account, keyHint, error: errorForStatus(response.status) }
     }
     const json = await readBoundedJson(response, MAX_USAGE_BODY_BYTES, controller.signal)
     if (!json.ok) {
-      return { kind: "error", index, account, error: errorForBounded(json.reason) }
+      return { kind: "error", index, account, keyHint, error: errorForBounded(json.reason) }
     }
     const payload = parseUsagePayload(json.value)
     if (!payload) {
-      return { kind: "error", index, account, error: "invalid usage response" }
+      return { kind: "error", index, account, keyHint, error: "invalid usage response" }
     }
-    return { kind: "ok", index, account, payload }
+    return { kind: "ok", index, account, keyHint, payload }
   })()
   void lookup.catch(() => {})
   try {
@@ -240,30 +257,31 @@ async function queryAccountUsage(
   } catch (error) {
     controller.abort()
     const errorText = isAbortError(error) ? "timed out" : "network error"
-    return { kind: "error", index, account, error: errorText }
+    return { kind: "error", index, account, keyHint, error: errorText }
   } finally {
     if (timer !== undefined) clearTimeout(timer)
+    stopWatching()
   }
 }
 
 export async function collectAccountUsage(
   accounts: GoAccount[],
-  options: { fetch?: UsageFetch; timeoutMs?: number } = {},
+  options: { fetch?: UsageFetch; timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<AccountUsageRow[]> {
   const useFetch = options.fetch ?? globalThis.fetch
   const timeoutMs = options.timeoutMs ?? USAGE_COMMAND_TIMEOUT_MS
   const rows: AccountUsageRow[] = new Array(accounts.length)
   await Promise.all(accounts.map(async (account, index) => {
     if (!account.enabled) {
-      rows[index] = { kind: "disabled", index, account }
+      rows[index] = { kind: "disabled", index, account: { label: account.label, role: account.role } }
       return
     }
-    rows[index] = await queryAccountUsage(account, index, useFetch, timeoutMs)
+    rows[index] = await queryAccountUsage(account, index, useFetch, timeoutMs, options.signal)
   }))
   return rows
 }
 
-export function collectStoredAccountUsage(options: { fetch?: UsageFetch; timeoutMs?: number } = {}) {
+export function collectStoredAccountUsage(options: { fetch?: UsageFetch; timeoutMs?: number; signal?: AbortSignal } = {}) {
   return collectAccountUsage(loadAccounts().accounts, options)
 }
 
@@ -341,7 +359,7 @@ export function formatAccountRow(row: AccountUsageRow) {
   if (row.kind === "disabled") {
     return `${prefix}  disabled (not queried)`
   }
-  const key = `key ${maskApiKey(row.account.apiKey)}`
+  const key = `key ${row.keyHint}`
   if (row.kind === "error") {
     return `${prefix}  ${key}  lookup failed\n   ${row.error}`
   }

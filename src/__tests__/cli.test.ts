@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test"
-import { mkdtempSync, rmSync } from "fs"
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
 import { loadAccounts, saveAccounts } from "../storage"
@@ -61,6 +61,33 @@ describe("oc-go-multi-auth cli roles", () => {
     expect((await runCli("add", "--key", "go_a", "--role", "paid")).exitCode).toBe(1)
     expect((await runCli("add", "--key", "go_a")).exitCode).toBe(0)
     expect((await runCli("set-role", "1", "paid")).exitCode).toBe(1)
+  })
+
+  it("keeps both accounts when two processes add at the same time", async () => {
+    const results = await Promise.all([
+      runCli("add", "--key", "go_parallel_a"),
+      runCli("add", "--key", "go_parallel_b"),
+    ])
+    expect(results.map((result) => result.exitCode)).toEqual([0, 0])
+    expect(loadAccounts().accounts.map((a) => a.apiKey).sort()).toEqual(["go_parallel_a", "go_parallel_b"])
+  })
+
+  it("refuses edits to a corrupt account file and leaves it in place", async () => {
+    const dir = join(tmpHome, ".config", "opencode")
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, "opencode-go-accounts.json"), "{broken")
+    const result = await runCli("add", "--key", "go_secret_should_not_print")
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain("is not valid")
+    expect(result.stderr).not.toContain("go_secret_should_not_print")
+    expect(readFileSync(join(dir, "opencode-go-accounts.json"), "utf-8")).toBe("{broken")
+  })
+
+  it("rejects an out-of-range account number", async () => {
+    await runCli("add", "--key", "go_a")
+    const result = await runCli("remove", "5")
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('invalid account number "5". Choose 1-1')
   })
 
   it("prints the usage report without leaking API keys", async () => {

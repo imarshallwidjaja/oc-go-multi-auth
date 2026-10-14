@@ -11,11 +11,14 @@ export interface GoAccount {
 export interface AccountsFile {
   version: 1
   accounts: GoAccount[]
+  /** Legacy sticky index. Read for compatibility; the runtime no longer writes it. */
   rotationIndex: number
 }
 
 export interface RotationState {
   lastUsedIndex: number
+  /** Non-secret account identity from accountId(); preferred over lastUsedIndex. */
+  lastUsedAccount?: string
 }
 
 export function normalizeAccountRole(role: unknown): AccountRole {

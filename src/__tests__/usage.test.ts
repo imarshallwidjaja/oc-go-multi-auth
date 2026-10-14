@@ -8,6 +8,7 @@ import {
   collectAccountUsage,
   formatAggregateUsage,
   formatUsageReport,
+  maskApiKey,
   parseUsagePayload,
   reportGoUsage,
 } from "../usage"
@@ -192,6 +193,7 @@ describe("formatUsageReport", () => {
         kind: "ok",
         index: 0,
         account: work,
+        keyHint: maskApiKey(work.apiKey),
         payload: {
           rolling: { status: "ok", percent: 12, resetsAt: "2026-09-15T08:00:00.000Z" },
           weekly: { status: "ok", percent: 40, resetsAt: "2026-09-20T00:00:00.000Z" },
@@ -202,6 +204,7 @@ describe("formatUsageReport", () => {
         kind: "ok",
         index: 1,
         account: personal,
+        keyHint: maskApiKey(personal.apiKey),
         payload: {
           rolling: { status: "rate-limited", percent: 100, resetsAt: "2026-09-15T12:00:00.000Z" },
           weekly: { status: "ok", percent: 3, resetsAt: "2026-09-20T00:00:00.000Z" },
@@ -213,6 +216,7 @@ describe("formatUsageReport", () => {
         kind: "ok",
         index: 3,
         account: unlabeled,
+        keyHint: maskApiKey(unlabeled.apiKey),
         payload: {
           rolling: { status: "ok", percent: 0, resetsAt: "2026-09-15T08:00:00.000Z" },
           weekly: { status: "ok", percent: 0, resetsAt: "2026-09-20T00:00:00.000Z" },
@@ -253,6 +257,7 @@ describe("formatUsageReport", () => {
       kind: "error",
       index: 0,
       account,
+      keyHint: maskApiKey(account.apiKey),
       error: "unauthorized (401)",
     }])
 
@@ -266,6 +271,7 @@ describe("formatUsageReport", () => {
       kind: "ok",
       index: 0,
       account: mk("key-aaaa", true, "Work"),
+      keyHint: maskApiKey("key-aaaa"),
       payload: {
         rolling: { status: "ok", percent: 1, resetsAt: "2026-09-15T08:00:00.000Z" },
         weekly: { status: "ok", percent: 1, resetsAt: "2026-09-20T00:00:00.000Z" },
@@ -277,6 +283,7 @@ describe("formatUsageReport", () => {
       kind: "ok",
       index: 0,
       account: mk("key-aaaa", true, "Work"),
+      keyHint: maskApiKey("key-aaaa"),
       payload: {
         rolling: { status: "ok", percent: 1, resetsAt: "2026-09-15T08:00:00.000Z" },
         weekly: { status: "ok", percent: 1, resetsAt: "2026-09-20T00:00:00.000Z" },
@@ -292,6 +299,7 @@ describe("formatUsageReport", () => {
       kind: "ok",
       index: 0,
       account: mk("key-aaaa", true, "Work"),
+      keyHint: maskApiKey("key-aaaa"),
       payload: {
         rolling: { status: "ok", percent: 1, resetsAt: "2026-09-15T08:00:00.000Z" },
         weekly: { status: "ok", percent: 1, resetsAt: "2026-09-20T00:00:00.000Z" },
@@ -315,6 +323,7 @@ describe("formatUsageReport", () => {
         kind: "ok" as const,
         index: 0,
         account: mk("key-aaaa1111", true, "Work"),
+        keyHint: maskApiKey("key-aaaa1111"),
         payload: {
           rolling: { status: "ok" as const, percent: 11.5, resetsAt: "2026-09-15T08:00:00.000Z" },
           weekly: { status: "rate-limited" as const, percent: 40, resetsAt: "2026-09-20T00:00:00.000Z" },
@@ -325,6 +334,7 @@ describe("formatUsageReport", () => {
         kind: "ok" as const,
         index: 1,
         account: mk("key-bbbb2222", true, "Personal"),
+        keyHint: maskApiKey("key-bbbb2222"),
         payload: {
           rolling: { status: "ok" as const, percent: 0, resetsAt: "2026-09-15T08:00:00.000Z" },
           weekly: { status: "ok" as const, percent: 0, resetsAt: "2026-09-20T00:00:00.000Z" },
@@ -351,6 +361,7 @@ describe("formatUsageReport", () => {
         kind: "error" as const,
         index: 1,
         account: mk("super-secret-key-zzzz", true, "Broken"),
+        keyHint: maskApiKey("super-secret-key-zzzz"),
         error: "network error",
       },
     ]
@@ -380,6 +391,7 @@ describe("formatUsageReport", () => {
       kind: "error",
       index: 0,
       account: mk("super-secret-key-zzzz", true, "Broken"),
+      keyHint: maskApiKey("super-secret-key-zzzz"),
       error: "unauthorized (401)",
     }])
     expect(report).toContain("lookup failed")

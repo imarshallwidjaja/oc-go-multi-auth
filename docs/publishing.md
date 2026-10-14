@@ -25,12 +25,12 @@ Both workflows use Bun 1.4.2 and Node 24 on GitHub-hosted Ubuntu runners. Node 2
 3. Confirms every path declared in `main`, `types`, `bin`, and `exports` is in the archive, that `LICENSE`, `README.md` and `package.json` are present, and that nothing else is: the only other files allowed are `dist/*.js` and `dist/*.d.ts`. Tests, source, and local state cannot enter the archive.
 4. Scans the built `dist/` files for imported packages and confirms each is declared in `dependencies` or `peerDependencies`. Installing the archive alone cannot catch an undeclared package that npm happens to hoist from another dependency.
 5. Installs that exact archive into an empty project in the system temp directory, with lifecycle scripts disabled, no checkout `node_modules`, and an isolated `HOME`. Only the package's own `dependencies` are available.
-6. Imports the root entry, `./tui`, and `./v2/provider` through the package `exports` map under both Node and Bun, and checks the shape of each export.
+6. Imports the root entry, `./tui`, and `./rpc` through the package `exports` map under both Node and Bun without any OpenCode package installed, checks the shape of each export, and checks that the retired `./v2/provider` export stays unpublished.
 7. Runs the installed `oc-go-multi-auth` bin with `--version`, `--help`, and `list`. The bin starts with `#!/usr/bin/env bun`, so Bun must be on `PATH`.
 
 On success the only line on stdout is the absolute path of the tarball; progress goes to stderr.
 
-The check does not load the package inside a real OpenCode host, and it does not type-check the `.d.ts` files against the optional `@opencode-ai/plugin` and `@opencode/plugin` peers. The root and `./tui` bundles import no host package at runtime, so the host SDKs are not installed during the smoke test. Whether OpenCode accepts the plugin is covered by the tests in `src/__tests__` and by manual use.
+The check does not load the package inside a real OpenCode host, and it does not type-check the `.d.ts` files against the optional `@opencode-ai/plugin` and `@opencode/plugin` peers. The root and `./tui` bundles import no host package at runtime, so the host SDKs are not installed during the smoke test. The tests in `src/__tests__` exercise the entry shapes against stand-in host contexts; whether a real OpenCode release accepts the plugin needs a run inside that release.
 
 ### Local and runner validation versus a real publish
 

@@ -20,10 +20,10 @@
       "import": "./dist/tui.js",
       "default": "./dist/tui.js"
     },
-    "./v2/provider": {
-      "types": "./dist/v2-provider.d.ts",
-      "import": "./dist/v2-provider.js",
-      "default": "./dist/v2-provider.js"
+    "./rpc": {
+      "types": "./dist/rpc.d.ts",
+      "import": "./dist/rpc.js",
+      "default": "./dist/rpc.js"
     }
   },
   "files": [
@@ -33,7 +33,7 @@
     "package.json"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && bun build ./src/index.ts --outfile dist/index.js --format esm --target node && bun build ./src/tui.ts --outfile dist/tui.js --format esm --target node && bun build ./src/v2-provider.ts --outfile dist/v2-provider.js --format esm --target node --packages external && bun build ./src/cli.ts --outfile dist/cli.js --format esm --target node",
+    "build": "tsc -p tsconfig.build.json && bun build ./src/index.ts --outfile dist/index.js --format esm --target node && bun build ./src/tui.ts --outfile dist/tui.js --format esm --target node && bun build ./src/rpc.ts --outfile dist/rpc.js --format esm --target node && bun build ./src/cli.ts --outfile dist/cli.js --format esm --target node",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "prepack": "bun run build"
@@ -59,11 +59,11 @@
     "access": "public"
   },
   "engines": {
-    "opencode": ">=1.18.29 <2 || >=2.0.2 <2.1"
+    "opencode": ">=1.18.29 <2 || >=2.0.28 <3"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.18.29 <2",
-    "@opencode/plugin": ">=2.0.2 <2.1"
+    "@opencode/plugin": ">=2.0.28 <3"
   },
   "peerDependenciesMeta": {
     "@opencode-ai/plugin": {
@@ -75,7 +75,7 @@
   },
   "devDependencies": {
     "@opencode-ai/plugin": "1.18.29",
-    "@opencode/plugin": "2.0.2",
+    "@opencode/plugin": "2.0.28",
     "@opentui/core": "0.4.5",
     "@opentui/keymap": "0.4.5",
     "@opentui/solid": "0.4.5",
@@ -85,9 +85,7 @@
     "typescript": "^5.8.0"
   },
   "dependencies": {
-    "@opencode/ai": "2.0.2",
-    "commander": "^14.0.3",
-    "effect": "4.0.0-rc.112"
+    "commander": "^14.0.3"
   },
   "directories": {
     "doc": "docs"
