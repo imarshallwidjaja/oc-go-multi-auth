@@ -66,7 +66,7 @@ const messageSignals: Array<[RegExp, RotationReason]> = [
   [/\bquota (?:exceeded|exhausted)\b/i, "body_quota"],
   [/\binsufficient quota\b/i, "body_quota"],
   [/\binvalid api key\b/i, "body_api_key"],
-  [/\bapi key (?:is )?(?:invalid|not valid|expired|revoked)\b/i, "body_api_key"],
+  [/\bapi key (?:(?:is|has(?: been)?) )?(?:invalid|not valid|expired|revoked)\b/i, "body_api_key"],
   [/\bauthentication (?:failed|required)\b/i, "body_authentication"],
   [/\bfailed to authenticate\b/i, "body_authentication"],
   [/\bnot entitled to (?:access|use) this model\b/i, "body_model_access"],
