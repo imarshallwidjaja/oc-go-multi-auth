@@ -39,13 +39,15 @@ function requestHeaders(input: RequestInfo | URL, init?: RequestInit) {
 
 const quietLogger = () => {}
 
-async function expectRotatableBody(body: string, contentType = "text/plain") {
+const goSubscriptionRequired = "An active OpenCode Go subscription is required to use Go models."
+
+async function expectRotatableBody(body: string, contentType = "text/plain", status = 403) {
   const accounts = [mk("key1"), mk("key2")]
   let callCount = 0
   const baseFetch = async () => {
     callCount++
     return callCount === 1
-      ? mockRes(403, body, { "content-type": contentType })
+      ? mockRes(status, body, { "content-type": contentType })
       : mockRes(200)
   }
 
@@ -598,11 +600,70 @@ describe("createRotatingFetch", () => {
     { name: "model entitlement", body: "not entitled to use this model" },
     { name: "model access", body: "You do not have access to this model" },
     { name: "entitlement required", body: "entitlement required" },
+    { name: "Go subscription required", body: goSubscriptionRequired },
+    { name: "Go subscription required with upstream prefix", body: `Upstream request failed: ${goSubscriptionRequired}` },
   ]) {
     it(`rotates on the terminal phrase: ${testCase.name}`, async () => {
       await expectRotatableBody(testCase.body)
     })
   }
+
+  for (const status of [500, 502]) {
+    for (const [contentType, body] of [
+      ["text/plain", `Upstream request failed: ${goSubscriptionRequired}`],
+      ["application/json", JSON.stringify({ error: { message: `Upstream request failed: ${goSubscriptionRequired}` } })],
+    ] as const) {
+      it(`rotates on the Go subscription error wrapped in a ${status} ${contentType} response`, async () => {
+        await expectRotatableBody(body, contentType, status)
+      })
+    }
+  }
+
+  it("blocks accounts without an active Go subscription and keeps the healthy replacement sticky", async () => {
+    const accounts = [mk("key-a"), mk("key-b"), mk("key-c")]
+    const authHeaders: string[] = []
+    const baseFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+      const authorization = requestHeaders(input, init).get("Authorization")!
+      authHeaders.push(authorization)
+      return authorization === "Bearer key-c"
+        ? mockRes(200)
+        : mockRes(500, JSON.stringify({ error: { message: `Upstream request failed: ${goSubscriptionRequired}` } }), {
+            "content-type": "application/json",
+          })
+    }
+
+    const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, { logger: quietLogger })
+
+    expect((await fetch("https://api.example.com/first")).status).toBe(200)
+    expect((await fetch("https://api.example.com/second")).status).toBe(200)
+    expect(authHeaders).toEqual(["Bearer key-a", "Bearer key-b", "Bearer key-c", "Bearer key-c"])
+    expect(state.blocked).toEqual(new Set([0, 1]))
+    expect(state.activeIndex).toBe(2)
+  })
+
+  it("returns the last upstream response intact when no account has an active Go subscription", async () => {
+    const accounts = [mk("key-a"), mk("key-b")]
+    const responses: Response[] = []
+    const baseFetch = async () => {
+      const response = mockRes(
+        500,
+        JSON.stringify({ error: { message: goSubscriptionRequired }, requestId: `request-${responses.length + 1}` }),
+        { "content-type": "application/json" },
+      )
+      responses.push(response)
+      return response
+    }
+
+    const { fetch, state } = createRotatingFetch(accounts, -1, baseFetch, { logger: quietLogger })
+    const result = await fetch("https://api.example.com")
+
+    expect(responses).toHaveLength(2)
+    expect(result).toBe(responses[1])
+    expect(result.bodyUsed).toBe(false)
+    expect(result.status).toBe(500)
+    expect(await result.json()).toEqual({ error: { message: goSubscriptionRequired }, requestId: "request-2" })
+    expect(state.blocked).toEqual(new Set([0, 1]))
+  })
 
   for (const testCase of [
     { name: "nested authentication_error code", body: { error: { code: "authentication_error" } } },
@@ -619,6 +680,8 @@ describe("createRotatingFetch", () => {
     { name: "nested model_not_entitled code", body: { error: { code: "model_not_entitled" } } },
     { name: "string authentication_error discriminator", body: { error: "authentication_error" } },
     { name: "nested terminal message", body: { error: { message: "entitlement required" } } },
+    { name: "top-level Go subscription message", body: { message: goSubscriptionRequired } },
+    { name: "string error Go subscription message", body: { error: `Upstream request failed: ${goSubscriptionRequired}` } },
     {
       name: "terminal message without a blocking discriminator",
       body: { error: { type: "provider_error", message: "rate limit exceeded" } },
@@ -673,6 +736,23 @@ describe("createRotatingFetch", () => {
     { name: "rate-limit validation", body: "rate_limit must be a positive integer", contentType: "text/plain" },
     { name: "usage-limit validation", body: "usage limit must be between 1 and 100", contentType: "text/plain" },
     { name: "bare authentication token", body: "authentication_error", contentType: "text/plain" },
+    {
+      name: "a generic subscription requirement",
+      body: "An active subscription is required to use billing reports.",
+      contentType: "text/plain",
+      status: 403,
+    },
+    {
+      name: "a subscription requirement for another product",
+      body: JSON.stringify({ error: { message: "An active OpenCode Zen subscription is required." } }),
+      contentType: "application/json",
+      status: 403,
+    },
+    {
+      name: "invalid request quoting the Go subscription message",
+      body: JSON.stringify({ error: { type: "invalid_request_error", message: goSubscriptionRequired } }),
+      contentType: "application/json",
+    },
     {
       name: "invalid request enumerating authentication_error",
       body: JSON.stringify({

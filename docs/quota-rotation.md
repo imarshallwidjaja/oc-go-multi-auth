@@ -36,6 +36,7 @@ The plugin blocks the current credential for the rest of the process and rotates
 - clear invalid or revoked API key signals
 - clear authentication failures
 - clear model entitlement or access failures
+- the OpenCode Go message `An active OpenCode Go subscription is required to use Go models.`, which blocks that account even when the provider wraps it in a 5xx response or an `Upstream request failed:` prefix
 
 The plugin applies a temporary cooldown and rotates for clear quota, rate-limit, or usage-limit signals. The default cooldown is 60 seconds. After the body or a structured discriminator establishes one of those conditions, a positive numeric-seconds or future HTTP-date `Retry-After` value sets the cooldown instead, capped at 10 minutes. Malformed, zero, or past values use the default cooldown.
 
@@ -53,7 +54,7 @@ The original response body remains available to OpenCode whenever the plugin sto
 
 The following do not rotate credentials:
 
-- bare 5xx responses without a credential-scoped signal
+- bare 5xx responses without a credential-scoped signal (the Go subscription message above is such a signal)
 - validation failures
 - network exceptions and aborts
 - bodies declared over 64 KiB, or bodies that reach 64 KiB without a decisive signal
