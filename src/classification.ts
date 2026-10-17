@@ -72,6 +72,7 @@ const messageSignals: Array<[RegExp, RotationReason]> = [
   [/\bnot entitled to (?:access|use) this model\b/i, "body_model_access"],
   [/\bdo not have access to this model\b/i, "body_model_access"],
   [/\bentitlement required\b/i, "body_model_access"],
+  [/\bactive opencode go subscription is required\b/i, "body_model_access"],
 ]
 
 const plaintextValidationSignals = [
