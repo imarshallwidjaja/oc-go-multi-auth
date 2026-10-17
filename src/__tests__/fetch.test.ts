@@ -40,6 +40,7 @@ function requestHeaders(input: RequestInfo | URL, init?: RequestInit) {
 const quietLogger = () => {}
 
 const goSubscriptionRequired = "An active OpenCode Go subscription is required to use Go models."
+const goKeyExpired = "This API key has expired. Create a new API key in OpenCode Console and replace it in your client or secret store. Signing in again will not renew this key."
 
 async function expectRotatableBody(body: string, contentType = "text/plain", status = 403) {
   const accounts = [mk("key1"), mk("key2")]
@@ -595,6 +596,8 @@ describe("createRotatingFetch", () => {
     { name: "API key is invalid", body: "API key is invalid" },
     { name: "API key is not valid", body: "This API key is not valid" },
     { name: "API key expired", body: "API key expired" },
+    { name: "API key has expired", body: "This API key has expired." },
+    { name: "Go API key expired", body: goKeyExpired },
     { name: "authentication failed", body: "authentication failed" },
     { name: "authentication required", body: "authentication required" },
     { name: "model entitlement", body: "not entitled to use this model" },
@@ -682,6 +685,8 @@ describe("createRotatingFetch", () => {
     { name: "nested terminal message", body: { error: { message: "entitlement required" } } },
     { name: "top-level Go subscription message", body: { message: goSubscriptionRequired } },
     { name: "string error Go subscription message", body: { error: `Upstream request failed: ${goSubscriptionRequired}` } },
+    { name: "nested Go expired-key message", body: { error: { message: goKeyExpired } } },
+    { name: "string error Go expired-key message", body: { error: goKeyExpired } },
     {
       name: "terminal message without a blocking discriminator",
       body: { error: { type: "provider_error", message: "rate limit exceeded" } },
@@ -753,6 +758,13 @@ describe("createRotatingFetch", () => {
       body: JSON.stringify({ error: { type: "invalid_request_error", message: goSubscriptionRequired } }),
       contentType: "application/json",
     },
+    {
+      name: "invalid request quoting the Go expired-key message",
+      body: JSON.stringify({ error: { type: "invalid_request_error", message: goKeyExpired } }),
+      contentType: "application/json",
+    },
+    { name: "an expired session that is not an API key", body: "Your session has expired.", contentType: "text/plain", status: 403 },
+    { name: "an expired API key example in a schema", body: "schema example: API key has expired", contentType: "text/plain" },
     {
       name: "invalid request enumerating authentication_error",
       body: JSON.stringify({

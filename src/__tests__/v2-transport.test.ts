@@ -167,6 +167,19 @@ describe("V2 HTTP attribution", () => {
     expect((await send(transport, new Response("ok"))).request.headers.get("authorization")).toBe("Bearer key-b")
   })
 
+  it("blocks an account whose API key has expired and retries on the next account", async () => {
+    const message = "This API key has expired. Create a new API key in OpenCode Console and replace it in your client or secret store. Signing in again will not renew this key."
+    const body = JSON.stringify({ error: { message } })
+    const { pool, transport } = setup([account("key-a"), account("key-b")])
+    await send(transport, new Response(body, { status: 403, headers: { "content-type": "application/json" } }))
+    expect(pool.state.blocked).toEqual(new Set([0]))
+
+    const retry = retryEvent(403, body)
+    await transport.retry(retry)
+    expect(retry.decision).toEqual({ retry: true, delay: 0 })
+    expect((await send(transport, new Response("ok"))).request.headers.get("authorization")).toBe("Bearer key-b")
+  })
+
   it("leaves unknown 429s and overloads to the host", async () => {
     const { pool, transport } = setup([account("key-a"), account("key-b")])
     await send(transport, new Response("slow down", { status: 429, headers: { "content-type": "text/plain" } }))
