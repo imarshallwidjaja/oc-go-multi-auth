@@ -1,4 +1,5 @@
-// OpenCode 2 server plugin: session hooks for rotation and the account RPC.
+// OpenCode 2 server plugin: session hooks for rotation, the account RPC, and
+// import of Go keys connected through the host's own dialogs.
 import type { Plugin } from "@opencode/plugin"
 import {
   AccountInputError,
@@ -13,6 +14,7 @@ import type { AccountPool } from "./pool.js"
 import { initializeAccountPool } from "./runtime.js"
 import { AccountsBusyError, AccountsCorruptError } from "./storage.js"
 import { baseURLOf, endpointWithin, isUnresolved, originOf, parseEndpoint } from "./destination.js"
+import { watchCredentialImports } from "./v2-import.js"
 import { createV2Transport, type Destination, type V2Transport } from "./v2-transport.js"
 import { collectStoredAccountUsage } from "./usage.js"
 
@@ -281,6 +283,7 @@ export async function setupV2(ctx: Context) {
   const registrations: Registration[] = []
   let transport: ReturnType<typeof createV2Transport> | undefined
   let lease: ReturnType<typeof acquirePool>
+  let stopImports: (() => Promise<void>) | undefined
   let active = true
   const lifetime = new AbortController()
   const cleanup = async () => {
@@ -288,6 +291,7 @@ export async function setupV2(ctx: Context) {
     active = false
     lifetime.abort()
     transport?.dispose()
+    await stopImports?.()
     lease?.release()
     await Promise.all(registrations.map((registration) => registration.dispose()))
   }
@@ -295,7 +299,9 @@ export async function setupV2(ctx: Context) {
   try {
     const authorization = createAuthorization(ctx)
     registrations.push(await registerRpc(ctx, authorization))
+    // The pool snapshot is taken before the importer can append, so imports wait for a restart.
     lease = acquirePool()
+    stopImports = await watchCredentialImports(ctx, { integrationID: PROVIDER_ID, authorize: () => authorization() })
     if (!lease) {
       log("warn", "rotation setup skipped", { reason: "no enabled accounts", action: "restart after adding an account" })
       return cleanup

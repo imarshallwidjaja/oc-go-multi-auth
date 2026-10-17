@@ -89,19 +89,49 @@ export async function addAccount(input: { apiKey: unknown; label?: unknown; role
   }
   const label = input.label?.trim() || undefined
   const role = input.role === undefined || input.role === "" ? "primary" : parseRole(input.role)
-  const { account, count } = await updateAccounts((data) => {
-    // The id hashes the key and add time. Duplicate keys are allowed, so two adds
-    // in one millisecond move the later one forward to keep ids unique.
-    let addedAt = Date.now()
-    while (data.accounts.some((existing) => existing.apiKey === apiKey && existing.addedAt === addedAt)) addedAt++
-    const account: GoAccount = { apiKey, label, addedAt, enabled: true, role }
-    data.accounts.push(account)
-    if (data.accounts.length === 1) data.rotationIndex = 0
-    return { account, count: data.accounts.length }
-  })
+  const { account, count } = await updateAccounts((data) => append(data, { apiKey, label, role }))
   const summary = summarize(account, count - 1, -1)
   log("info", "add", { label: summary.label, role, count })
   return { account: summary, count }
+}
+
+/** Appends an enabled account. Runs inside updateAccounts. */
+function append(data: AccountsFile, input: Pick<GoAccount, "apiKey" | "label" | "role">) {
+  // The id hashes the key and add time. Duplicate keys are allowed, so two adds
+  // in one millisecond move the later one forward to keep ids unique.
+  let addedAt = Date.now()
+  while (data.accounts.some((existing) => existing.apiKey === input.apiKey && existing.addedAt === addedAt)) addedAt++
+  const account: GoAccount = { apiKey: input.apiKey, label: input.label, addedAt, enabled: true, role: input.role }
+  data.accounts.push(account)
+  if (data.accounts.length === 1) data.rotationIndex = 0
+  return { account, count: data.accounts.length }
+}
+
+// Thrown inside updateAccounts so a duplicate import leaves the file unwritten.
+const alreadyPooled = Symbol("already pooled")
+
+/**
+ * Adds a key the host connected as a primary account, unless any account
+ * already holds it, enabled or not. The check runs under the account lock, so
+ * concurrent imports of one key append it once and never change an existing
+ * account. Unlike addAccount, it never creates a duplicate.
+ */
+export async function importAccount(input: { apiKey: string; label?: string }) {
+  const apiKey = input.apiKey.trim()
+  if (!apiKey) throw new AccountInputError("An API key is required.")
+  const label = input.label?.trim() || undefined
+  try {
+    const { account, count } = await updateAccounts((data) => {
+      if (data.accounts.some((existing) => existing.apiKey.trim() === apiKey)) throw alreadyPooled
+      return append(data, { apiKey, label, role: "primary" })
+    })
+    const summary = summarize(account, count - 1, -1)
+    log("info", "import", { label: summary.label, count })
+    return { status: "imported" as const, account: summary, count }
+  } catch (error) {
+    if (error === alreadyPooled) return { status: "duplicate" as const }
+    throw error
+  }
 }
 
 export async function setAccountRole(ref: AccountRef, role: unknown) {

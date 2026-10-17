@@ -18,7 +18,7 @@ One package serves both OpenCode generations. OpenCode 1.18.29+ calls the V1 `se
 - **Live-session account stickiness** — Successful requests keep using the same account when it remains preferred. A successful replacement becomes sticky for later requests and is recorded for the next start.
 - **Safe response classification** — HTTP 401/402 and clear credential signals block an account for the process. Clear quota, rate, or usage signals apply a bounded cooldown. Engine overload and unknown 429 responses are left to OpenCode without penalizing an account.
 - **Quota report** — `/go-usage` and `oc-go-multi-auth usage` query `GET https://opencode.ai/zen/go/v1/usage` for every stored account. The report leads with the summed leftover percent for the 5-hour, weekly, and monthly windows across accounts whose lookup succeeded. A rate-limited window is left out of that window's sum. Each account lists remaining vs used percent. Remaining dollars are not on that endpoint today.
-- **Account management** — `/go-accounts` inside OpenCode (V1 and V2) and the `oc-go-multi-auth` CLI add accounts, change roles, and remove accounts. Edits are locked, so concurrent edits from several places do not overwrite each other.
+- **Account management** — `/go-accounts` inside OpenCode (V1 and V2) and the `oc-go-multi-auth` CLI add accounts, change roles, and remove accounts. Edits are locked, so concurrent edits from several places do not overwrite each other. On V1, OpenCode's provider connect flow also offers **Add Go Account**, which adds an account from the stock web UI of a headless server. On V2, a Go API key connected in OpenCode's own provider settings is added to the pool.
 - **Persistent state** — Accounts and the last-used account survive restarts.
 - **No modifications to OpenCode** — Installs as a plugin, zero risk to your existing setup.
 
@@ -98,11 +98,15 @@ oc-go-multi-auth add --key <key> --label "Work"
 
 From a source checkout, run `bun run src/cli.ts add --key <key> --label "Work"` instead.
 
+On OpenCode 1 you can also add accounts through OpenCode's own provider connect flow, which works from the stock web UI of a headless server. Choose **Add Go Account** for OpenCode Go in the web UI's provider list, in the TUI's `/connect`, or with `opencode auth login -p opencode-go -m "Add Go Account"`. It asks for the key, a label (required here), and a role, adds the account to the pool, and connects OpenCode Go with that key, replacing the key OpenCode had stored for `opencode-go`. Once OpenCode Go is connected, reach it again through **Show more providers** to add the next account. See [Add Go Account](./docs/account-management.md#add-go-account-opencode-1-provider-connect).
+
+On OpenCode 2 you can connect the key in the server's web UI instead: **Settings** → **Providers** → **Go Accounts** → **Add account** → **Use API key**. The plugin adds each key connected this way to the pool as a `primary` account, unless the pool already holds it. Keys OpenCode had stored before the server started are not added, and removing an account from the pool never brings it back from OpenCode's credentials. See [Keys connected in OpenCode 2's provider settings](./docs/account-management.md#keys-connected-in-opencode-2s-provider-settings).
+
 Repeat for each Go subscription you own.
 
 ### 3. Restart OpenCode
 
-The running process keeps the account list it loaded at startup, so restart OpenCode after adding accounts or changing roles. When OpenCode has no `opencode-go` key yet, the first account added through `/go-accounts` also connects OpenCode Go with that key; on V2 the plugin does the same at startup. A stored key stays as it is. On V1 a connection from an environment variable or from configuration may sit on top of a stored key that OpenCode's public API cannot show, so `/go-accounts` asks first: **Connect pool account** stores the new key (replacing any stored OpenCode Go key), **Keep current connection** leaves the connection unchanged, and rotation then needs a stored key and a restart. On V2 nothing is connected when OpenCode has rebound `opencode-go` to another integration such as a Console one, and the pool leaves that provider alone. The V2 pool also writes a key only onto requests that go to the base URL OpenCode has configured for Go (the provider's, or the selected model's or variant's); anything else keeps the host's own credential and is logged as `rotation inactive`.
+The running process keeps the account list it loaded at startup, so restart OpenCode after adding accounts or changing roles, including keys the V2 plugin added from OpenCode's provider settings. The exception is **Add Go Account** completed in the web UI or the TUI: OpenCode reloads its server instance after the connection, which reloads the pool. After `opencode auth login` with **Add Go Account**, restart any OpenCode server that is already running. When OpenCode has no `opencode-go` key yet, the first account added through `/go-accounts` also connects OpenCode Go with that key; on V2 the plugin does the same at startup. A stored key stays as it is. On V1 a connection from an environment variable or from configuration may sit on top of a stored key that OpenCode's public API cannot show, so `/go-accounts` asks first: **Connect pool account** stores the new key (replacing any stored OpenCode Go key), **Keep current connection** leaves the connection unchanged, and rotation then needs a stored key and a restart. On V2 nothing is connected when OpenCode has rebound `opencode-go` to another integration such as a Console one, and the pool leaves that provider alone. The V2 pool also writes a key only onto requests that go to the base URL OpenCode has configured for Go (the provider's, or the selected model's or variant's); anything else keeps the host's own credential and is logged as `rotation inactive`.
 
 ---
 
@@ -112,6 +116,8 @@ The running process keeps the account list it loaded at startup, so restart Open
 |---|---|---|
 | OpenCode | `/go-accounts` | Add an account, change a role, or remove an account |
 | OpenCode | `/go-usage` | Quota report for every stored account |
+| OpenCode 1 provider connect | **Add Go Account** | Add an account and connect OpenCode Go with its key |
+| OpenCode 2 provider settings | **Go Accounts** → **Add account** → **Use API key** | Connect a key in OpenCode; the plugin adds it to the pool |
 | Terminal | `oc-go-multi-auth list` | List configured accounts and roles |
 | Terminal | `oc-go-multi-auth add --key <key> [--label …] [--role …]` | Add an account |
 | Terminal | `oc-go-multi-auth set-role <number> <primary\|overage_fallback>` | Set an account's preference role |
@@ -119,7 +125,7 @@ The running process keeps the account list it loaded at startup, so restart Open
 | Terminal | `oc-go-multi-auth status` | Show account counts by role and the last-used account |
 | Terminal | `oc-go-multi-auth usage` | Same report as `/go-usage` |
 
-OpenCode's own provider connection (`opencode auth login`, or connecting OpenCode Go from OpenCode's provider list) stores a single key for the stock provider. That key is separate from the pool: removing a pool account does not disconnect or delete a key stored in OpenCode.
+OpenCode's own provider connection stores a single key for the stock provider. On OpenCode 1, the stock **Go API key** method (the first method for OpenCode Go in `opencode auth login` or OpenCode's provider list) stores only that key and adds nothing to the pool, and **Add Go Account** stores the key in OpenCode the same way and also adds it to the pool. On OpenCode 2, a key connected with **Use API key** while the server runs is also added to the pool. The stored key is separate from the pool either way: removing a pool account does not disconnect or delete a key stored in OpenCode, and switching or removing OpenCode's credentials does not change the pool.
 
 `/go-usage` and `oc-go-multi-auth usage` call `GET https://opencode.ai/zen/go/v1/usage` with each enabled account's API key. The report leads with the summed leftover percent for the 5-hour, weekly, and monthly windows across accounts whose lookup succeeded. A rate-limited window is left out of that window's sum. The endpoint returns percent-used for those windows. It does not currently return remaining dollars. Disabled accounts are listed as not queried. Per-account HTTP or network failures stay on that account; the rest of the report still prints. On the V1 screen, that aggregate is the first row.
 
@@ -133,7 +139,7 @@ Both commands come from the package's `./tui` entry. On V2 they reach the server
 }
 ```
 
-OpenCode V1 loads them from `tui.json` and edits the local account file directly; manage a remote V1 server's accounts with the CLI on that server. When using a source checkout instead of the registry package, configure the built files with absolute paths (relative source-checkout paths are not supported):
+OpenCode V1 loads them from `tui.json` and edits the local account file directly. To add accounts to a remote V1 server, use **Add Go Account** in the server's web UI or in a TUI attached to it; that runs on the server and writes the server's account file. For role changes and removal, run the CLI on that server. When using a source checkout instead of the registry package, configure the built files with absolute paths (relative source-checkout paths are not supported):
 
 `~/.config/opencode/opencode.json`:
 
@@ -153,7 +159,7 @@ OpenCode V1 loads them from `tui.json` and edits the local account file directly
 
 Select `/go-usage` or `/go-accounts` from slash completion or the command palette. Use Up/Down, PageUp/PageDown, Home/End, and Enter to browse account details; Escape closes the report. If autocomplete is dismissed or unavailable, submitting `/go-usage` sends the literal text as an ordinary prompt even when the TUI plugin is loaded; the V1 server command API cannot suppress that model turn. The same fallback applies if the TUI entrypoint is disabled or fails to load.
 
-On V1, OpenCode runs the plugin's loader only when `opencode-go` has a stored key. Add the first account through `/go-accounts` (which stores the key when none is stored; a connection from the environment or configuration asks you to choose **Connect pool account** or **Keep current connection**) or connect any Go key with OpenCode's provider flow, then restart. The standalone CLI cannot reach OpenCode, so it never connects a key. On V2, setup connects the first eligible pool key when `opencode-go` has no connection and is still bound to the Go integration.
+On V1, OpenCode runs the plugin's loader only when `opencode-go` has a stored key. Add the first account through **Add Go Account** (which always stores its key), through `/go-accounts` (which stores the key when none is stored; a connection from the environment or configuration asks you to choose **Connect pool account** or **Keep current connection**), or connect any Go key with OpenCode's provider flow, then restart. The standalone CLI cannot reach OpenCode, so it never connects a key. On V2, setup connects the first eligible pool key when `opencode-go` has no connection and is still bound to the Go integration.
 
 ---
 
@@ -173,7 +179,7 @@ Accounts and rotation state live in `~/.config/opencode/`:
 
 | File | Written by | Purpose |
 |---|---|---|
-| `opencode-go-accounts.json` | `/go-accounts`, the CLI | Stored API keys, labels, roles, enabled state |
+| `opencode-go-accounts.json` | `/go-accounts`, the CLI, **Add Go Account** (V1), the key import (V2) | Stored API keys, labels, roles, enabled state |
 | `opencode-go-accounts.json.lock` | edits, while they run | Serializes edits; removed when the edit finishes |
 | `opencode-go-rotation.json` | the running plugin | Last-used account, by index and a non-secret account fingerprint |
 
@@ -202,6 +208,7 @@ Maintainers publishing to npm: see [docs/publishing.md](./docs/publishing.md).
 ```
 index.ts ── V1 server(): auth loader ──▶ runtime.ts ──▶ fetch.ts (replay loop)
          └─ V2 setup() ──▶ v2.ts ──▶ v2-transport.ts (session hooks)
+                                  ├─▶ v2-import.ts (keys connected in OpenCode)
                                   └─▶ rpc.ts (account RPC contract)
 tui.ts ── /go-accounts, /go-usage ──▶ tui-flows.ts
 

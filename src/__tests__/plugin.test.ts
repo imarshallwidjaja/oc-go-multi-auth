@@ -1,8 +1,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test"
-import { mkdtempSync, readFileSync, rmSync } from "fs"
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
-import { join } from "path"
-import type { Plugin as V1Plugin } from "@opencode-ai/plugin"
+import { dirname, join } from "path"
+import type { AuthHook, Plugin as V1Plugin } from "@opencode-ai/plugin"
 import { GoAccountsRpc } from "../rpc"
 import { accountId, accountsPath, loadAccounts, loadRotationState, saveAccounts, saveRotationState } from "../storage"
 import type { GoAccount } from "../types"
@@ -84,20 +84,34 @@ afterAll(() => {
 })
 
 describe("OpenCode V1 adapter", () => {
-  it("offers only the stock single-key method and never writes credentials from the loader", async () => {
+  it("offers the stock single-key method first, then Add Go Account, and never writes from the loader", async () => {
     expect(plugin.id).toBe("oc-go-multi-auth")
     expect(typeof plugin.setup).toBe("function")
     expect(typeof plugin.server).toBe("function")
     saveAccounts({ version: 1, accounts: [goAccount("key-a", 10)], rotationIndex: 0 })
+    const before = readFileSync(accountsPath(), "utf-8")
     let authWrites = 0
     const hooks = await plugin.server(pluginInput({ auth: { set: async () => { authWrites++ } } }))
 
     expect(hooks.auth!.provider).toBe("opencode-go")
-    expect(hooks.auth!.methods).toEqual([{ type: "api", label: "Go API key" }])
+    const methods = hooks.auth!.methods
+    expect(methods.map(({ type, label }) => ({ type, label }))).toEqual([
+      { type: "api", label: "Go API key" },
+      { type: "oauth", label: "Add Go Account" },
+    ])
+    expect(methods[0]).toEqual({ type: "api", label: "Go API key" })
+    const prompts = methods[1].prompts!
+    expect(prompts.map((prompt) => [prompt.type, prompt.key, prompt.message])).toEqual([
+      ["text", "apiKey", "Go API key"],
+      ["text", "label", "Account label"],
+      ["select", "role", "Account role"],
+    ])
+    expect(prompts[2].type === "select" && prompts[2].options.map((option) => option.value)).toEqual(["primary", "overage_fallback"])
     const options = await hooks.auth!.loader!(async () => ({ type: "api", key: "key-a" }), {} as any)
     expect(options.apiKey).toBe("")
     expect(typeof options.fetch).toBe("function")
     expect(authWrites).toBe(0)
+    expect(readFileSync(accountsPath(), "utf-8")).toBe(before)
   })
 
   it("returns no loader options without enabled accounts", async () => {
@@ -209,6 +223,121 @@ describe("OpenCode V1 adapter", () => {
     await hooks.config?.(config as any)
     expect(config.command?.["go-usage"]).toBeUndefined()
     expect(hooks["command.execute.before"]).toBeUndefined()
+  })
+})
+
+describe("OpenCode V1 Add Go Account connector", () => {
+  type OAuthMethod = Extract<AuthHook["methods"][number], { type: "oauth" }>
+
+  async function connector() {
+    const hooks = await plugin.server(pluginInput())
+    const method = hooks.auth!.methods.find((candidate) => candidate.label === "Add Go Account")
+    if (method?.type !== "oauth") throw new Error("Add Go Account is not an OAuth-shaped method")
+    return method as OAuthMethod
+  }
+
+  async function hostCallback(authorization: Awaited<ReturnType<OAuthMethod["authorize"]>>) {
+    expect(authorization.method).toBe("auto")
+    return (authorization as Extract<typeof authorization, { method: "auto" }>).callback()
+  }
+
+  const accountFile = () => readFileSync(accountsPath(), "utf-8")
+  const logText = () => readFileSync(join(tmpHome, ".config", "opencode", "oc-go-multi-auth.log"), "utf-8")
+
+  it("adds the account only in the callback, keeps earlier accounts, and returns the key for the host connection", async () => {
+    saveAccounts({ version: 1, accounts: [goAccount("key-old-0001", 10, "Old")], rotationIndex: 0 })
+    const before = accountFile()
+    const method = await connector()
+
+    const authorization = await method.authorize({ apiKey: "  go-new-key-1234  ", label: " Work ", role: "overage_fallback" })
+    expect(authorization.url).toBe("https://opencode.ai/auth")
+    expect(authorization.instructions).not.toContain(":")
+    expect(JSON.stringify(authorization)).not.toContain("go-new-key-1234")
+    expect(accountFile()).toBe(before)
+
+    expect(await hostCallback(authorization)).toEqual({ type: "success", key: "go-new-key-1234" })
+    expect(loadAccounts().accounts).toMatchObject([
+      { apiKey: "key-old-0001", label: "Old", role: "primary" },
+      { apiKey: "go-new-key-1234", label: "Work", role: "overage_fallback", enabled: true },
+    ])
+    expect(logText()).not.toContain("go-new-key-1234")
+  })
+
+  it("saves once per authorization across repeated and concurrent callbacks, and never mixes two authorizations", async () => {
+    const method = await connector()
+    const first = await method.authorize({ apiKey: "go-key-aaaa", label: "Alpha", role: "primary" }) as any
+    const second = await method.authorize({ apiKey: "go-key-bbbb", label: "Beta", role: "overage_fallback" }) as any
+    // Replaced before its callback ran, as when the host's pending entry is overwritten.
+    await method.authorize({ apiKey: "go-key-cccc", label: "Abandoned", role: "primary" })
+
+    const [one, two] = await Promise.all([second.callback(), second.callback()])
+    expect(one).toBe(two)
+    expect(await second.callback()).toBe(one)
+    expect(await first.callback()).toEqual({ type: "success", key: "go-key-aaaa" })
+    expect(await first.callback()).toEqual({ type: "success", key: "go-key-aaaa" })
+    expect(loadAccounts().accounts.map(({ apiKey, label, role }) => [apiKey, label, role])).toEqual([
+      ["go-key-bbbb", "Beta", "overage_fallback"],
+      ["go-key-aaaa", "Alpha", "primary"],
+    ])
+
+    // A new authorization is a new add, consistent with duplicate keys being allowed.
+    await (await method.authorize({ apiKey: "go-key-aaaa", label: "Alpha again", role: "primary" }) as any).callback()
+    expect(loadAccounts().accounts.map((account) => account.label)).toEqual(["Beta", "Alpha", "Alpha again"])
+  })
+
+  it("rejects blank, missing, or invalid inputs without writing or exposing the key", async () => {
+    saveAccounts({ version: 1, accounts: [goAccount("key-old-0001", 10, "Old")], rotationIndex: 0 })
+    const before = accountFile()
+    const method = await connector()
+    const [keyPrompt, labelPrompt] = method.prompts! as Array<{ validate?: (value: string) => string | undefined }>
+    expect(keyPrompt.validate!("   ")).toBe("Enter a Go API key")
+    expect(keyPrompt.validate!("go-key")).toBeUndefined()
+    expect(labelPrompt.validate!("")).toBe("Enter an account label")
+
+    for (const inputs of [
+      undefined,
+      {},
+      { apiKey: "  ", label: "Work", role: "primary" },
+      { apiKey: "secret-go-key-9999", role: "primary" },
+      { apiKey: "secret-go-key-9999", label: "   ", role: "primary" },
+      { apiKey: "secret-go-key-9999", label: "Work", role: "paid" },
+      { apiKey: "secret-go-key-9999", label: "Work", role: "" },
+    ]) {
+      const authorization = await method.authorize(inputs)
+      expect(authorization.instructions).not.toContain(":")
+      expect(JSON.stringify(authorization)).not.toContain("secret-go-key-9999")
+      expect(await hostCallback(authorization)).toEqual({ type: "failed" })
+    }
+    expect(accountFile()).toBe(before)
+  })
+
+  it("defaults an omitted role to primary for direct HTTP callers", async () => {
+    const method = await connector()
+    await (await method.authorize({ apiKey: "go-key-dddd", label: "Direct" }) as any).callback()
+    expect(loadAccounts().accounts).toMatchObject([{ apiKey: "go-key-dddd", label: "Direct", role: "primary" }])
+  })
+
+  it("fails safely and leaves the account file in place when storage is corrupt or busy", async () => {
+    const method = await connector()
+    writeFileSync(accountsPath(), "{ not json")
+    const corrupt = await method.authorize({ apiKey: "secret-go-key-corrupt", label: "Work", role: "primary" })
+    expect(await hostCallback(corrupt)).toEqual({ type: "failed" })
+    expect(accountFile()).toBe("{ not json")
+
+    saveAccounts({ version: 1, accounts: [goAccount("key-old-0001", 10, "Old")], rotationIndex: 0 })
+    const before = accountFile()
+    const lock = `${accountsPath()}.lock`
+    writeFileSync(lock, "held by another edit\n")
+    try {
+      const busy = await method.authorize({ apiKey: "secret-go-key-busy", label: "Work", role: "primary" })
+      expect(await hostCallback(busy)).toEqual({ type: "failed" })
+    } finally {
+      rmSync(lock, { force: true })
+    }
+    expect(accountFile()).toBe(before)
+    expect(logText()).toContain('"msg":"add go account failed"')
+    expect(logText()).toContain("Account file is busy")
+    expect(logText()).not.toContain("secret-go-key-")
   })
 })
 
@@ -467,6 +596,75 @@ describe("OpenCode V1 TUI adapter", () => {
   })
 })
 
+type FakeCredential = { id: string; label: string; value: { type: "key"; key: string } | { type: "oauth" | "external" } }
+
+/**
+ * OpenCode 2's Go credential store and live event bus as plugins see them
+ * (core v2.0.28 Credential and Bus). Contexts sharing one store model plugin
+ * instances in one server: every live subscription receives every event, and
+ * a subscription sees only events published after its first read.
+ */
+function fakeCredentialStore(initial: Array<{ id: string; key?: string; method?: "oauth" | "external" }> = []) {
+  let created = 0
+  const credentials: FakeCredential[] = initial.map(({ id, key, method }) => ({
+    id,
+    label: "OpenCode Go",
+    value: method ? { type: method } : { type: "key", key: key ?? `${id}-key` },
+  }))
+  const listeners = new Set<(event: unknown) => void>()
+  const store = {
+    credentials,
+    listeners,
+    /** Credential ids and env names passed to connection.resolve, in call order. */
+    resolved: [] as string[],
+    /** An environment variable connection listed after the stored credentials. */
+    env: undefined as string | undefined,
+    activeID: credentials.at(-1)?.id as string | undefined,
+    getError: undefined as Error | undefined,
+    /** Runs once a listing has been taken, before integration.get returns it; the listing waits for a returned promise. */
+    afterList: undefined as (() => Promise<void> | void) | undefined,
+    /** Thrown by every live event subscription at its next wake-up. */
+    streamError: undefined as Error | undefined,
+    /** Thrown by the next connection.resolve only. */
+    resolveError: undefined as Error | undefined,
+    /** Runs inside connection.resolve before it returns. */
+    onResolve: undefined as (() => Promise<void> | void) | undefined,
+    publish(event: unknown) {
+      for (const listener of [...listeners]) listener(event)
+    },
+    /** Like Credential.create with activation: commit, then credential.updated and credential.switched. */
+    create(value: FakeCredential["value"] | string) {
+      const id = `crd_new_${++created}`
+      const label = credentials.length === 0 ? "OpenCode Go" : `OpenCode Go ${credentials.length + 1}`
+      credentials.push({ id, label, value: typeof value === "string" ? { type: "key", key: value } : value })
+      store.activeID = id
+      store.publish({ type: "credential.updated", data: {} })
+      store.publish({ type: "credential.switched", data: { integrationID: "opencode-go", credentialID: id } })
+      return id
+    },
+    activate(id: string) {
+      store.activeID = id
+      store.publish({ type: "credential.switched", data: { integrationID: "opencode-go", credentialID: id } })
+    },
+    /** Removes a credential; removing the active one switches to the newest remaining. */
+    remove(id: string) {
+      credentials.splice(credentials.findIndex((credential) => credential.id === id), 1)
+      store.publish({ type: "credential.updated", data: {} })
+      if (store.activeID === id) store.activate(credentials.at(-1)?.id ?? (null as never))
+    },
+    connections() {
+      const stored = credentials.map((credential) => ({
+        type: "credential",
+        id: credential.id,
+        label: credential.label,
+        method: credential.value.type,
+      })).toReversed()
+      return [...stored, ...(store.env ? [{ type: "env", name: store.env }] : [])]
+    },
+  }
+  return store
+}
+
 function fakeV2Context(options: {
   version?: string
   connected?: boolean
@@ -477,6 +675,8 @@ function fakeV2Context(options: {
   models?: unknown[]
   /** Leaves out ctx.model.list, as an older host would. */
   noModelList?: boolean
+  /** A credential store shared with other contexts; by default each context has its own. */
+  store?: ReturnType<typeof fakeCredentialStore>
 } = {}) {
   const hooks: Array<{ name: string; callback: Function; options?: { providerID?: string } }> = []
   const connects: Array<{ integrationID: string; key: string }> = []
@@ -489,8 +689,8 @@ function fakeV2Context(options: {
     models: options.models ?? [],
     onRead: undefined as (() => void) | undefined,
   }
-  const pending: unknown[] = []
-  let wake: (() => void) | undefined
+  const store = options.store ?? fakeCredentialStore(options.connected ? [{ id: "existing", key: "host-key" }] : [])
+  const queues = new Set<unknown[]>()
   const subscriptions: AbortSignal[] = []
   const context = {
     app: { version: options.version ?? "2.0.28", channel: "latest" },
@@ -508,17 +708,33 @@ function fakeV2Context(options: {
     ...(options.noModelList ? {} : { model: { list: async () => ({ location: {}, data: owner.models }) } }),
     event: {
       subscribe: (requestOptions?: { signal?: AbortSignal }) => {
-        if (requestOptions?.signal) subscriptions.push(requestOptions.signal)
+        const signal = requestOptions?.signal
+        if (signal) subscriptions.push(signal)
         return (async function* () {
-          while (!requestOptions?.signal?.aborted) {
-            if (pending.length > 0) {
-              yield pending.shift()
-              continue
+          // Like the SDK adapter, the host subscription starts at the first read.
+          const queue: unknown[] = []
+          let wake: (() => void) | undefined
+          const listener = (event: unknown) => {
+            queue.push(event)
+            wake?.()
+          }
+          store.listeners.add(listener)
+          queues.add(queue)
+          try {
+            while (!signal?.aborted) {
+              if (store.streamError) throw store.streamError
+              if (queue.length > 0) {
+                yield queue.shift()
+                continue
+              }
+              await new Promise<void>((resolve) => {
+                wake = resolve
+                signal?.addEventListener("abort", () => resolve(), { once: true })
+              })
             }
-            await new Promise<void>((resolve) => {
-              wake = resolve
-              requestOptions?.signal?.addEventListener("abort", () => resolve(), { once: true })
-            })
+          } finally {
+            store.listeners.delete(listener)
+            queues.delete(queue)
           }
         })()
       },
@@ -536,11 +752,30 @@ function fakeV2Context(options: {
       },
     },
     integration: {
-      connection: { active: async () => options.connected ? { type: "credential", id: "existing" } : undefined },
+      get: async ({ integrationID }: { integrationID: string }) => {
+        if (store.getError) throw store.getError
+        if (integrationID !== "opencode-go") throw new Error(`unexpected integration ${integrationID}`)
+        const connections = store.connections()
+        await store.afterList?.()
+        return { location: {}, data: { id: "opencode-go", name: "OpenCode Go", methods: [], connections } }
+      },
+      connection: {
+        active: async () => store.connections()[0],
+        resolve: async (connection: { type: string; id?: string; name?: string }) => {
+          store.resolved.push(connection.id ?? `env:${connection.name}`)
+          await store.onResolve?.()
+          const failure = store.resolveError
+          store.resolveError = undefined
+          if (failure) throw failure
+          if (connection.type === "env") return { type: "key", key: "env-key" }
+          return store.credentials.find((credential) => credential.id === connection.id)?.value
+        },
+      },
       connect: {
         key: async (input: { integrationID: string; key: string }) => {
           if (options.connectError) throw options.connectError
           connects.push(input)
+          store.create(input.key)
         },
       },
     },
@@ -549,11 +784,8 @@ function fakeV2Context(options: {
     signal,
     error: (type: string, message: string, data: unknown) => ({ type, message, data }),
   })
-  const emit = (event: unknown) => {
-    pending.push(event)
-    wake?.()
-  }
-  return { context, hooks, connects, disposed, call, emit, owner, subscriptions, pendingEvents: () => pending.length, get rpc() { return rpc } }
+  const pendingEvents = () => [...queues].reduce((total, queue) => total + queue.length, 0)
+  return { context, hooks, connects, disposed, call, emit: store.publish, owner, store, subscriptions, pendingEvents, get rpc() { return rpc } }
 }
 
 describe("OpenCode V2 server adapter", () => {
@@ -875,15 +1107,17 @@ describe("OpenCode V2 server adapter", () => {
     expect(afterFrame.headers.get("authorization")).toBe("Bearer key-b")
   })
 
-  it("stops listening for session events on cleanup", async () => {
+  it("stops listening for session and credential events on cleanup", async () => {
     saveAccounts({ version: 1, accounts: [goAccount("key-a", 10)], rotationIndex: 0 })
     const host = fakeV2Context({ connected: true })
     const cleanup = (await setupV2(host.context))!
-    expect(host.subscriptions).toHaveLength(1)
-    expect(host.subscriptions[0].aborted).toBe(false)
+    // The credential importer and the session-end watcher.
+    expect(host.subscriptions).toHaveLength(2)
+    expect(host.subscriptions.some((signal) => signal.aborted)).toBe(false)
     await cleanup()
     cleanups.length = 0
-    expect(host.subscriptions[0].aborted).toBe(true)
+    expect(host.subscriptions.every((signal) => signal.aborted)).toBe(true)
+    await until(() => host.store.listeners.size === 0 ? true : undefined, "subscriptions closed")
   })
 
   it("stops a usage query when the RPC caller goes away", async () => {
@@ -916,6 +1150,380 @@ describe("OpenCode V2 server adapter", () => {
       expect(JSON.stringify(result)).not.toContain("secret-usage-key-77aa")
     } finally {
       restore()
+    }
+  })
+
+  describe("credential import", () => {
+    const logPath = () => join(tmpHome, ".config", "opencode", "oc-go-multi-auth.log")
+    /** Log text written after the returned mark was taken. */
+    const logFrom = () => {
+      const start = readFileSync(logPath(), "utf-8").length
+      return () => readFileSync(logPath(), "utf-8").slice(start)
+    }
+    const keys = () => loadAccounts().accounts.map((account) => account.apiKey)
+    const accountCount = (count: number) => until(() => loadAccounts().accounts.length === count ? true : undefined, `${count} accounts`)
+    const pool = (...apiKeys: string[]) => saveAccounts({
+      version: 1,
+      accounts: apiKeys.map((apiKey, index) => goAccount(apiKey, 10 + index)),
+      rotationIndex: 0,
+    })
+
+    it("imports a key connected after startup, never one it started with, and never re-adds a removed account", async () => {
+      pool("key-a")
+      const store = fakeCredentialStore([{ id: "crd_old", key: "old-host-key" }, { id: "crd_oauth", method: "oauth" }])
+      const host = fakeV2Context({ store })
+      await setupV2(host.context)
+      expect(host.connects).toEqual([])
+      const log = logFrom()
+
+      const id = store.create("new-host-key-7777")
+      await accountCount(2)
+      expect(loadAccounts().accounts[1]).toMatchObject({ apiKey: "new-host-key-7777", label: "OpenCode Go 3", role: "primary", enabled: true })
+      expect(store.resolved).toEqual([id])
+      await until(() => log().includes("account imported") ? true : undefined, "import log")
+      expect(log()).toContain("restart the OpenCode server")
+      expect(log()).not.toContain("new-host-key-7777")
+
+      // Pool and host credentials are managed independently from here on.
+      const listed = await host.call("list", {}) as { accounts: Array<{ id: string }> }
+      await host.call("remove", { id: listed.accounts[1].id })
+      store.activate("crd_old")
+      store.activate(id)
+      store.remove(id)
+      // Reconciles run in event order, so once a later key is in, the events above were handled.
+      const later = store.create("later-host-key")
+      await accountCount(2)
+      expect(keys()).toEqual(["key-a", "later-host-key"])
+      expect(store.resolved).toEqual([id, later])
+    })
+
+    it("imports with an empty pool, and skips the key the startup activation connected", async () => {
+      const empty = fakeV2Context()
+      const stopEmpty = (await setupV2(empty.context))!
+      empty.store.create("first-host-key")
+      await accountCount(1)
+      // The running server has no pool until it restarts.
+      expect(empty.hooks).toEqual([])
+      // A watcher whose startup listing fails holds the history only until it gives up.
+      const unlisted = fakeV2Context()
+      unlisted.store.getError = new Error("listing down")
+      const stopUnlisted = (await setupV2(unlisted.context))!
+      // Restart. The new host store reuses the credential id the stopped server imported,
+      // so this also checks that the stopped server's import history was dropped.
+      await stopUnlisted()
+      await stopEmpty()
+
+      pool("key-a")
+      const before = readFileSync(accountsPath(), "utf-8")
+      const log = logFrom()
+      const host = fakeV2Context()
+      await setupV2(host.context)
+      expect(host.connects).toEqual([{ integrationID: "opencode-go", key: "key-a" }])
+      await until(() => log().includes("an account already holds this key") ? true : undefined, "duplicate skip")
+      expect(host.store.resolved).toEqual(["crd_new_1"])
+      expect(readFileSync(accountsPath(), "utf-8")).toBe(before)
+    })
+
+    it("catches a key connected after the startup listing but before the subscription", async () => {
+      pool("key-a")
+      const host = fakeV2Context({ connected: true })
+      let id: string | undefined
+      host.store.afterList = () => {
+        host.store.afterList = undefined
+        // Its events reach no subscriber yet.
+        id = host.store.create("startup-race-key")
+      }
+      await setupV2(host.context)
+      await accountCount(2)
+      expect(keys()).toEqual(["key-a", "startup-race-key"])
+      expect(host.store.resolved).toEqual([id!])
+    })
+
+    it("imports two keys connected in quick succession under their own credentials", async () => {
+      pool("key-a")
+      const host = fakeV2Context({ connected: true })
+      await setupV2(host.context)
+      const ids = [host.store.create("burst-key-1"), host.store.create("burst-key-2")]
+      await accountCount(3)
+      expect(keys()).toEqual(["key-a", "burst-key-1", "burst-key-2"])
+      expect(loadAccounts().accounts.map((account) => account.label)).toEqual([undefined, "OpenCode Go 2", "OpenCode Go 3"])
+      expect(host.store.resolved).toEqual(ids)
+    })
+
+    it("reads only new Go key credentials, and only while the provider belongs to the Go integration", async () => {
+      pool("key-a")
+      const host = fakeV2Context({ connected: true, integrationID: "opencode" })
+      host.store.env = "OPENCODE_API_KEY"
+      await setupV2(host.context)
+      let reads = 0
+      let rebindRead = false
+      let rebound: string | undefined
+      host.owner.onRead = () => {
+        reads++
+        if (rebound && host.store.resolved.includes(rebound)) rebindRead = true
+      }
+      host.store.create({ type: "oauth" })
+      host.store.create({ type: "external" })
+      const consoleTime = host.store.create("console-time-key")
+      // The importer asked who owns the provider and stopped there.
+      await until(() => reads > 0 ? true : undefined, "binding check")
+      expect(host.store.resolved).toEqual([])
+
+      host.owner.integrationID = "opencode-go"
+      host.store.activate("existing")
+      await accountCount(2)
+      expect(keys()).toEqual(["key-a", "console-time-key"])
+      // Never an OAuth, external or environment connection, nor the startup credential.
+      expect(host.store.resolved).toEqual([consoleTime])
+
+      // A rebind while the key is read keeps it out; it is retried at the next credential event.
+      host.store.onResolve = () => { host.owner.integrationID = "opencode" }
+      rebound = host.store.create("rebound-key")
+      await until(() => rebindRead ? true : undefined, "binding recheck after the read")
+      host.store.onResolve = undefined
+      host.owner.integrationID = "opencode-go"
+      host.store.activate("existing")
+      await accountCount(3)
+      // Read twice: the first read was dropped, so the key was imported by the retry.
+      expect(host.store.resolved).toEqual([consoleTime, rebound, rebound])
+    })
+
+    it("reads and appends a new key once when two plugin instances share the server", async () => {
+      pool("key-a")
+      const store = fakeCredentialStore([{ id: "existing", key: "host-key" }])
+      await setupV2(fakeV2Context({ store }).context)
+      await setupV2(fakeV2Context({ store }).context)
+      let listings = 0
+      store.afterList = () => { listings++ }
+      // The first read waits until both instances have listed the new credential.
+      store.onResolve = () => until(() => listings >= 2 ? true : undefined, "both listings").then(() => {})
+      const id = store.create("shared-key")
+      await accountCount(2)
+      store.onResolve = undefined
+      // The instance that waited for the first import settled the credential without reading it.
+      const next = store.create("next-key")
+      await accountCount(3)
+      expect(keys()).toEqual(["key-a", "shared-key", "next-key"])
+      expect(store.resolved).toEqual([id, next])
+    })
+
+    it("keeps the import history of each account file apart", async () => {
+      pool("key-a")
+      const store = fakeCredentialStore([{ id: "existing", key: "host-key" }])
+      await setupV2(fakeV2Context({ store }).context)
+      const id = store.create("first-home-key")
+      await accountCount(2)
+
+      // A watcher of another account file decides the same credential id for itself.
+      const otherHome = mkdtempSync(join(tmpdir(), "go-plugin-other-home-"))
+      process.env.HOME = otherHome
+      try {
+        saveAccounts({ version: 1, accounts: [goAccount("key-b", 10)], rotationIndex: 0 })
+        const other = fakeCredentialStore([{ id: "existing", key: "host-key" }])
+        const cleanup = (await setupV2(fakeV2Context({ store: other }).context))!
+        expect(other.create("other-home-key")).toBe(id)
+        await accountCount(2)
+        expect(keys()).toEqual(["key-b", "other-home-key"])
+        await cleanup()
+      } finally {
+        process.env.HOME = tmpHome
+        rmSync(otherHome, { recursive: true, force: true })
+      }
+      expect(keys()).toEqual(["key-a", "first-home-key"])
+    })
+
+    it("never re-adds a removed key through an instance that refused it while another imported it", async () => {
+      pool("key-a")
+      const store = fakeCredentialStore([{ id: "crd_old", key: "old-host-key" }])
+      const go = fakeV2Context({ store })
+      const consoleOwned = fakeV2Context({ store, integrationID: "opencode" })
+      // Subscribed first, so it considers the new credential first and refuses it.
+      await setupV2(consoleOwned.context)
+      await setupV2(go.context)
+      let refusals = 0
+      consoleOwned.owner.onRead = () => { refusals++ }
+      const id = store.create("new-host-key")
+      await accountCount(2)
+      await until(() => refusals > 0 ? true : undefined, "refusal by the Console-owned instance")
+
+      const listed = await go.call("list", {}) as { accounts: Array<{ id: string }> }
+      await go.call("remove", { id: listed.accounts[1].id })
+      consoleOwned.owner.integrationID = "opencode-go"
+      store.activate("crd_old")
+      const later = store.create("later-host-key")
+      await until(() => keys().includes("later-host-key") ? true : undefined, "later import")
+      // Only the formerly refusing instance can import this one. It handles events in
+      // order, so once this key is in, it has reconsidered the removed key's credential.
+      go.owner.integrationID = "opencode"
+      const sentinel = store.create("sentinel-key")
+      await until(() => keys().includes("sentinel-key") ? true : undefined, "sentinel import")
+      expect(keys()).toEqual(["key-a", "later-host-key", "sentinel-key"])
+      // Each credential is read by one instance only.
+      expect(store.resolved).toEqual([id, later, sentinel])
+    })
+
+    it("keeps the import history while a starting instance still reads its baseline, so a key removed meanwhile stays removed", async () => {
+      pool("key-a")
+      const store = fakeCredentialStore([{ id: "existing", key: "host-key" }])
+      let releaseBaseline!: () => void
+      const baselineHeld = new Promise<void>((resolve) => { releaseBaseline = resolve })
+      // The late instance has listed the connections, without the key below, but not yet returned them.
+      store.afterList = () => {
+        store.afterList = undefined
+        return baselineHeld
+      }
+      const late = setupV2(fakeV2Context({ store }).context)
+      await until(() => store.afterList === undefined ? true : undefined, "late baseline listing")
+
+      // Meanwhile the only fully started instance imports the key, the user removes it, and the instance stops.
+      const early = fakeV2Context({ store })
+      const stopEarly = (await setupV2(early.context))!
+      store.create("removed-host-key")
+      await accountCount(2)
+      const listed = await early.call("list", {}) as { accounts: Array<{ id: string }> }
+      await early.call("remove", { id: listed.accounts[1].id })
+      await stopEarly()
+
+      releaseBaseline()
+      await late
+      // Reconciles run in event order, so once this key is in, the late instance's catch-up listing has been handled.
+      const sentinel = store.create("sentinel-key")
+      await until(() => keys().includes("sentinel-key") ? true : undefined, "sentinel import")
+      expect(keys()).toEqual(["key-a", "sentinel-key"])
+      expect(store.resolved).toEqual(["crd_new_1", sentinel])
+    })
+
+    it("retries after a transient failure, and stops at a corrupt account file after one backup", async () => {
+      pool("key-a")
+      const host = fakeV2Context({ connected: true })
+      await setupV2(host.context)
+      const log = logFrom()
+      host.store.resolveError = new Error("store refused retry-key-secret")
+      const id = host.store.create("retry-key-secret")
+      await until(() => log().includes("could not be read") ? true : undefined, "read failure")
+      expect(log()).not.toContain("retry-key-secret")
+      // The credential.switched event that follows the creation retries it.
+      await accountCount(2)
+      expect(host.store.resolved).toEqual([id, id])
+
+      const configDir = join(tmpHome, ".config", "opencode")
+      const backups = () => readdirSync(configDir).filter((name) => name.startsWith("opencode-go-accounts.json.bak.")).length
+      const before = backups()
+      writeFileSync(accountsPath(), "{broken")
+      host.store.create("corrupt-key-1")
+      await until(() => log().includes("account import stopped") ? true : undefined, "import stop")
+      // The importer unsubscribed; only the session-end watcher still listens.
+      await until(() => host.store.listeners.size === 1 ? true : undefined, "importer unsubscribed")
+      host.store.create("corrupt-key-2")
+      expect(backups()).toBe(before + 1)
+      expect(readFileSync(accountsPath(), "utf-8")).toBe("{broken")
+    })
+
+    it("keeps host error text out of the log when a later listing or the event stream fails", async () => {
+      pool("key-a")
+      const host = fakeV2Context({ connected: true })
+      await setupV2(host.context)
+      const log = logFrom()
+      const importerEntries = () => log().split("\n").filter((line) => line.includes('"msg":"account import'))
+      host.store.getError = new Error("cannot decode sk-listing-secret")
+      host.store.create("listing-key")
+      await until(() => log().includes("could not be listed") ? true : undefined, "listing failure")
+      host.store.getError = undefined
+
+      host.store.streamError = new Error("stream closed while encoding sk-stream-secret")
+      host.store.publish({ type: "credential.updated", data: {} })
+      await until(() => log().includes("the event stream failed") ? true : undefined, "stream failure")
+      expect(importerEntries().length).toBeGreaterThan(1)
+      for (const entry of importerEntries()) {
+        expect(entry).not.toContain("secret")
+        expect(entry).toContain('"error":"Error"')
+      }
+    })
+
+    it("admits no import after cleanup starts, and cleanup waits for a read in progress", async () => {
+      pool("key-a")
+      const host = fakeV2Context({ connected: true })
+      const cleanup = (await setupV2(host.context))!
+      cleanups.length = 0
+      let release: (() => void) | undefined
+      host.store.onResolve = () => new Promise<void>((resolve) => { release = resolve })
+      host.store.create("late-key")
+      const unblock = await until(() => release, "read in progress")
+
+      let finished = false
+      const stopping = cleanup().then(() => { finished = true })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(finished).toBe(false)
+      unblock()
+      await stopping
+      expect(keys()).toEqual(["key-a"])
+      await until(() => host.store.listeners.size === 0 ? true : undefined, "unsubscribed")
+      host.store.create("after-cleanup-key")
+      expect(host.store.resolved).toHaveLength(1)
+    })
+
+    it("imports nothing when the startup listing fails, and keeps rotation", async () => {
+      pool("key-a")
+      const host = fakeV2Context({ connected: true })
+      // The host decodes stored values while listing, so its errors can quote a key.
+      host.store.getError = new Error("listing down: cannot decode sk-startup-secret")
+      const log = logFrom()
+      await setupV2(host.context)
+      expect(host.hooks).toHaveLength(5)
+      expect(log()).toContain("could not be listed at startup")
+      expect(log()).not.toContain("sk-startup-secret")
+      host.store.getError = undefined
+      // Only the session-end watcher subscribed.
+      expect(host.subscriptions).toHaveLength(1)
+      host.store.create("unseen-key")
+      expect(host.store.resolved).toEqual([])
+    })
+  })
+})
+
+describe("OpenCode V2 SDK event adapter", () => {
+  // The importer lists credentials right after requesting the subscription, so a
+  // credential created after that listing must reach the subscription. The host
+  // side here is modeled on core v2.0.28 Bus.subscribe: a live PubSub stream.
+  it("subscribes to the host stream during the first read, before it settles", async () => {
+    const adapterPath = Bun.resolveSync("@opencode/plugin/promise/adapter", import.meta.dir)
+    const { fromPromise } = await import(adapterPath)
+    // The adapter's own Effect copy, so the host stream runs on the same runtime.
+    const { Effect, Exit, PubSub, Scope, Stream } = await import(Bun.resolveSync("effect", dirname(adapterPath)))
+    const pubsub = Effect.runSync(PubSub.unbounded())
+    const delivered: unknown[] = []
+    const subscribe = () => Stream.unwrap(Effect.sync(() => Stream.fromPubSub(pubsub))).pipe(
+      Stream.filter(() => true),
+      Stream.tap((event: unknown) => Effect.sync(() => { delivered.push(event) })),
+    )
+    // Every host member the adapter reads at setup, as inert stubs.
+    const stub = (path: string): any => new Proxy(() => {}, {
+      get: (_target, key) => {
+        if (typeof key === "symbol") return undefined
+        return path === "" && key === "event" ? { subscribe } : stub(`${path}.${key}`)
+      },
+      apply: () => Effect.void,
+    })
+    let ctx: any
+    const scope = Effect.runSync(Scope.make())
+    await Effect.runPromise(fromPromise({ id: "order-probe", setup: async (context: unknown) => { ctx = context } }).effect(stub("")).pipe(Scope.provide(scope)))
+    try {
+      const controller = new AbortController()
+      const iterator = ctx.event.subscribe({ signal: controller.signal })[Symbol.asyncIterator]()
+      // In this install the adapter's encoding of a valid event fails with "s.startsWith is not
+      // a function" inside the OpenCodeEvent schema, so the read never yields it. This test
+      // therefore checks only that the host subscription exists before the first read settles.
+      const first = iterator.next().then(() => {}, () => {})
+      // A credential.updated envelope as core v2.0.28 publishes it, sent synchronously after
+      // the first read was requested, with no await in between.
+      const event = { id: "evt_probe", created: 1_760_000_000_000, type: "credential.updated", data: {} }
+      Effect.runSync(PubSub.publish(pubsub, event))
+      await until(() => delivered.length > 0 ? true : undefined, "delivery")
+      expect(delivered).toEqual([event])
+      controller.abort()
+      await first
+    } finally {
+      await Effect.runPromise(Scope.close(scope, Exit.void))
     }
   })
 })

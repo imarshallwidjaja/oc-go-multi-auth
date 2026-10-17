@@ -18,11 +18,13 @@ src/
 ├── v2-transport.ts    # V2 transport: session hooks for HTTP, WebSocket and retry
 ├── destination.ts     # V2 request-destination comparison (origin, path segments, ws/wss)
 ├── v2.ts              # V2 setup(): host check, RPC handlers, hook registration, activation
+├── v2-import.ts       # V2 import of Go API keys connected through the host's provider settings
 ├── rpc.ts             # Portable RPC contract for account management (plain JSON Schema)
 ├── runtime.ts         # Startup snapshot for both hosts; writes the rotation hint
 ├── usage.ts           # Usage endpoint parse, per-account collection, report formatting
 ├── tui-flows.ts       # Host-neutral /go-accounts and /go-usage flows
 ├── tui.ts             # V1 tui() and V2 setup() for the terminal UI
+├── v1-connect.ts      # V1 "Add Go Account" provider-connect method
 ├── index.ts           # Default export: V1 server() and V2 setup()
 ├── cli.ts             # oc-go-multi-auth command line
 └── __tests__/
@@ -69,7 +71,7 @@ None of the entries imports an OpenCode package at runtime; plugin API imports a
 
 The rotating fetch replays one logical request across accounts: it sets `Authorization: Bearer <key>`, classifies the response, settles a penalty, and tries the next preferred account, waiting for the earliest cooldown when every account is cooling. A successful replacement becomes sticky and is written to the rotation hint, mapped to the current account file by API key and `addedAt`.
 
-The V1 auth hook offers OpenCode's stock single-key method (`{ type: "api", label: "Go API key" }`). Pool accounts are managed with `/go-accounts` or the CLI.
+The V1 auth hook offers two methods. The first is OpenCode's stock single-key method (`{ type: "api", label: "Go API key" }`), which the host handles without calling the plugin. The second, **Add Go Account** (`v1-connect.ts`), adds a pool account and connects OpenCode Go with the same key. OpenCode 1 calls plugin code over HTTP only for OAuth-shaped methods, so this method uses the OAuth shape: `authorize()` validates the prompts and writes nothing, and the immediate `auto` callback adds the account through `accounts.ts` and returns `{ type: "success", key }`, which the host stores as its `opencode-go` API credential. Each authorization saves at most once, however many times its callback runs. The loader still writes nothing. Pool accounts can also be managed with `/go-accounts` or the CLI.
 
 ---
 
@@ -80,11 +82,23 @@ The V1 auth hook offers OpenCode's stock single-key method (`{ type: "api", labe
 On a supported host, setup:
 
 1. registers the account RPC (`rpc.ts`, handlers in `v2.ts`);
-2. loads the startup snapshot; with no enabled account it stops here and rotation starts after a restart;
+2. loads the startup snapshot, then starts the credential importer (see [Credential import](#credential-import)); with no enabled account it stops here and rotation starts after a restart;
 3. registers five session hooks scoped to provider `opencode-go`: `http.request`, `http.response`, `experimental.ws.handshake`, `experimental.ws.receive`, and `retry`, and subscribes to the host's event stream so a finished session's state can be dropped;
 4. connects the first eligible pool key to the `opencode-go` integration when the provider is still bound to that integration and the integration has no active connection. An existing connection is never replaced, and a failure is logged without stopping rotation.
 
-The cleanup function stops the event subscription, disposes the transport (aborting session scopes and clearing its maps and the pool), and disposes every registration.
+The cleanup function stops the event subscriptions, disposes the transport (aborting session scopes and clearing its maps and the pool), waits for an import already admitted, and disposes every registration.
+
+### Credential import
+
+`watchCredentialImports()` in `v2-import.ts` adds Go API keys that the host connects after setup to the account file. The pool snapshot is loaded before it starts, so an imported key reaches rotation only after a restart.
+
+1. It lists the `opencode-go` integration with `ctx.integration.get()` and records every credential id it sees, of every method. These ids are never imported. If this listing fails, the importer logs `account import unavailable` and does nothing for the rest of the process; it does not treat the failure as an empty list, which would import every stored key.
+2. It subscribes to `ctx.event.subscribe()` and lists the integration once more, to catch a credential created between the first listing and the subscription.
+3. On `credential.updated`, or on `credential.switched` for `opencode-go`, it lists the integration again. Listings run one at a time; changes that arrive during one coalesce into a single further listing.
+
+Each credential id not yet recorded is considered in turn. Connections carry no creation time and the host's listing is not in creation order, so a burst of new keys is imported in no guaranteed order. An OAuth or external credential is recorded without being read, because `connection.resolve` may refresh an OAuth token. For an API-key credential the importer runs the owner check from [Credential authorization](#credential-authorization), resolves that exact credential, runs the owner check again, and calls `importAccount()` in `accounts.ts`. Under the account-file lock, `importAccount()` appends a `primary` account only when no account holds the trimmed key, and otherwise leaves the file unwritten. The id is recorded after the import or the duplicate skip, so activating or removing host credentials later never re-adds an account the user removed from the pool, and a key the plugin's own activation connected is skipped as a duplicate. A failed owner check, a failed resolve, or a busy file leaves the id unrecorded, so the next credential event retries it. A damaged account file stops the importer, so that each event does not save another `.bak` copy.
+
+The host provides no ready signal or replay cursor for its live event stream. The installed `@opencode/plugin` 2.0.28 adapter starts the host subscription during the iterator's first `next()` call, and the importer makes that call before the catch-up listing; a test checks this ordering against the adapter with a host stream modelled on core's `Bus.subscribe`. A credential change the host never delivers, for example after the stream fails, is missed and the importer logs `account import stopped`. Several plugin instances in one server keep their own startup baseline but share one in-memory import history per account file. An import, a duplicate skip, or an empty resolve settles the credential id for every instance, and a claim held during the owner checks, the resolve and `importAccount()` makes other instances wait for that outcome instead of reading the key themselves. A failure releases the claim without settling the id, so any instance retries it at the next event. Without the shared history an instance that refused a key while another imported it could add the account back after the user removed it. The history is not persisted; it is dropped when the last importer of that account file stops, and an importer started later lists the settled ids in its baseline anyway. The lock-protected duplicate check still keeps one account per key. Stopping aborts the subscription, admits no further import, and waits for an import in progress, so nothing writes after cleanup resolves. The importer never activates, relabels, or removes host credentials, and its log entries name labels and reasons but never a key or an unrecognised error message. That covers `ctx.integration.get()` too, because the host decodes stored credential values while listing them, so its errors can quote a key.
 
 ### Credential authorization
 
@@ -149,6 +163,8 @@ Session hooks cover the agent loop, compaction, title generation, and `session.g
 - the CLI, which addresses accounts by their 1-based number;
 - the V1 TUI, which edits the local file directly;
 - the V2 RPC, which the V2 TUI calls through `context.client.rpc(GoAccountsRpc)` and which also works for remote clients.
+
+It also implements `importAccount()` for the V2 credential importer. Unlike an add, an import never creates a duplicate key and never changes an existing account.
 
 The TUI selects accounts by a stable id (a truncated SHA-256 of `addedAt` and the key) rather than by position, so an account that moved or disappeared since the list was shown is rejected with a clear message instead of editing the wrong entry. Duplicate keys stay allowed, so an add moves `addedAt` forward by a millisecond, under the edit lock, when the same key was added at the same time; an id shared by two accounts in an older file is rejected rather than resolved to the first match (use the CLI number). Numbers given to the CLI are resolved inside the locked edit. Summaries carry a masked key hint and never the key; error messages never contain a key.
 

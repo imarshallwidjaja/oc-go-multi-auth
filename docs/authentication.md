@@ -25,22 +25,23 @@ Each key is tied to one Go subscription and its quota.
 
 ## Adding Pool Accounts
 
-Use `/go-accounts` inside OpenCode, or the CLI:
+Use `/go-accounts` inside OpenCode, **Add Go Account** in OpenCode 1's provider connect flow, OpenCode 2's own provider settings, or the CLI:
 
 ```sh
 oc-go-multi-auth add --key <key> --label "Work" --role primary
 ```
 
-See [account-management.md](./account-management.md) for the full workflow. Restart OpenCode after changing the pool; the running plugin keeps the account list it loaded at startup.
+See [account-management.md](./account-management.md) for the full workflow, including [keys connected in OpenCode 2's provider settings](./account-management.md#keys-connected-in-opencode-2s-provider-settings). Restart OpenCode after changing the pool; the running plugin keeps the account list it loaded at startup.
 
 ---
 
 ## Connecting OpenCode Go
 
-OpenCode needs one connected `opencode-go` key before it routes Go requests at all. The plugin fills that in only when it is missing, and never replaces a key you connected yourself:
+OpenCode needs one connected `opencode-go` key before it routes Go requests at all. `/go-accounts` and V2 setup fill that in only when it is missing, and never replace a key you connected yourself. **Add Go Account** is the one path that always connects its key, because choosing it is the request to connect:
 
 | Host | When | What the plugin does |
 |---|---|---|
+| OpenCode 1 | **Add Go Account** completes in OpenCode's provider connect flow | Adds the account to the pool, then returns the key to OpenCode, which stores it as the `opencode-go` key and replaces any key stored before. The previous key stays in the pool only if it was a pool account |
 | OpenCode 1 | `/go-accounts` adds an account | If `opencode-go` is not connected, stores the new key with the V1 SDK's `auth.set`. A stored key is kept. The public API reports a connection from the environment or configuration as such even when a stored key sits underneath, and it cannot show that key, so the TUI asks you to choose **Connect pool account** (replaces any stored OpenCode Go key) or **Keep current connection** (the connection is left unchanged; rotation needs a stored key and a restart) |
 | OpenCode 2 | `/go-accounts` adds an account | If `opencode-go` has no active connection, connects the new key with `integration.connect.key` |
 | OpenCode 2 | plugin setup at startup | If `opencode-go` has no active connection, connects the first eligible pool key |
@@ -49,7 +50,7 @@ OpenCode 2 never connects a key when `opencode-go` has been rebound to another i
 
 The account is saved first. A failed connection is reported separately ("Saved …, but connecting OpenCode Go failed") with any key in the message replaced by `[redacted]`, and the pool account stays saved.
 
-You can also connect a key yourself with OpenCode's stock flow: `opencode auth login` and the **Go API key** method on OpenCode 1, or the OpenCode Go entry in OpenCode 2's provider list. That stores one key in OpenCode, independent of the pool. Removing a pool account does not remove a connected host key; remove that through OpenCode's own provider settings.
+You can also connect a key yourself with OpenCode's stock flow: `opencode auth login` and the **Go API key** method on OpenCode 1, or **Go Accounts** → **Add account** → **Use API key** in OpenCode 2's provider settings. On OpenCode 1 that stores one key in OpenCode and adds nothing to the pool. On OpenCode 2 the plugin also adds a newly connected key to the pool as a `primary` account unless the pool already holds it, and the server uses it after a restart; see [Keys connected in OpenCode 2's provider settings](./account-management.md#keys-connected-in-opencode-2s-provider-settings). Removing a pool account does not remove a connected host key; remove that through OpenCode's own provider settings.
 
 ---
 
@@ -66,7 +67,7 @@ return {
 
 OpenCode uses the returned `fetch` for every `opencode-go` call. The rotating fetch sets `Authorization: Bearer <key>` for the current pool account and replays a cloneable request with another account when a credential or quota failure calls for it. The loader does not write to OpenCode's auth store.
 
-The auth hook lists OpenCode's stock single-key method (**Go API key**), so `opencode auth login` and the provider dialog keep working as they do without the plugin.
+The auth hook lists OpenCode's stock single-key method (**Go API key**) first, so `opencode auth login` and the provider dialog keep working as they do without the plugin. **Add Go Account** follows it; see [Add Go Account](./account-management.md#add-go-account-opencode-1-provider-connect). The account file is written by that method's completion, never by the loader.
 
 ---
 
@@ -101,5 +102,12 @@ Nothing is placed in provider settings, and no provider package, model package, 
 **OpenCode 2: plugin setup fails with "supports OpenCode 1.18.29+ (V1) and >=2.0.28 <3 (V2)"**
 → The host is older than 2.0.28 or lacks the session hook, RPC, provider lookup, or key-connection APIs. Update OpenCode.
 
+**OpenCode 2: a key connected in OpenCode's provider settings is not in the pool**
+→ Check `~/.config/opencode/oc-go-multi-auth.log`. `account imported` means it was added; restart the server to use it. `account import skipped` with "an account already holds this key" means the pool already had that key. Keys stored before the server started are never imported, and neither are credentials stored through a sign-in or external method. `account import unavailable` or `account import stopped` means imports are off until the server restarts. In every case you can add the key with `/go-accounts` or `oc-go-multi-auth add`.
+
 **New accounts or roles have no effect**
-→ Restart OpenCode. Edits are saved immediately but apply to the running plugin only after a restart.
+→ Restart OpenCode. Edits are saved immediately but apply to the running plugin only after a restart. **Add Go Account** completed in the web UI or the TUI is the exception, because OpenCode reloads its server instance after the connection. `opencode auth login` runs in its own process, so a server that was already running needs a restart.
+
+**OpenCode 1: Add Go Account fails**
+→ The method saves the account to the pool first and then asks OpenCode to store the key. The two steps are not one transaction and nothing is rolled back, so a failure does not by itself say which step stopped. A missing key or label, or a role other than `primary` or `overage_fallback`, is rejected before anything is written. A busy or damaged account file also fails before the pool changes; `~/.config/opencode/oc-go-multi-auth.log` has an `add go account failed` entry with the reason, and [Concurrent Edits and Damaged Files](./account-management.md#concurrent-edits-and-damaged-files) explains the fix. If OpenCode fails afterward while storing the key or reloading, the account stays in the pool and the plugin's log has no entry for that failure.
+→ When the outcome is unclear, check the pool on the server with `/go-accounts` or `oc-go-multi-auth list`. If the account is listed, connect OpenCode Go with the **Go API key** method and the same key. Do not run **Add Go Account** again: each run is a separate authorization and adds a duplicate account.

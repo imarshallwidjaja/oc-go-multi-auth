@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "bun:test"
 import { mkdtempSync, writeFileSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from "fs"
 import { join } from "path"
 import { tmpdir } from "os"
-import { AccountInputError, addAccount, removeAccount, setAccountRole } from "../accounts"
+import { AccountInputError, addAccount, importAccount, removeAccount, setAccountRole } from "../accounts"
 import {
   accountId,
   accountsPath,
@@ -220,6 +220,51 @@ describe("account edits", () => {
 
     await setAccountRole({ number: 2 }, "overage_fallback")
     expect(loadAccounts().accounts.map((a) => a.role)).toEqual(["primary", "overage_fallback"])
+  })
+
+  it("imports a key once as a primary account and never touches an account that already holds it", async () => {
+    // Existing accounts holding the key in any state, including a hand-edited padded copy and a manual duplicate.
+    const existing = [
+      { ...account("held-key", 1), enabled: false, label: "off" },
+      { ...account(" fallback-key\n", 2), role: "overage_fallback" as const },
+      account("dup-key", 3),
+      account("dup-key", 4),
+    ]
+    saveAccounts({ version: 1, accounts: existing, rotationIndex: 2 })
+    const before = readFileSync(accountsPath(), "utf-8")
+    const inode = statSync(accountsPath()).ino
+    for (const apiKey of ["held-key", "fallback-key", " dup-key "]) {
+      expect(await importAccount({ apiKey })).toEqual({ status: "duplicate" })
+    }
+    // A duplicate leaves the file unwritten: every write renames a new file into place.
+    expect(statSync(accountsPath()).ino).toBe(inode)
+    expect(readFileSync(accountsPath(), "utf-8")).toBe(before)
+    await expect(importAccount({ apiKey: "  " })).rejects.toBeInstanceOf(AccountInputError)
+
+    // Concurrent edits of one new key. The first import takes the lock first; the
+    // later imports see its account, while a manual add may still duplicate the key.
+    const [first, second, manual, third] = await Promise.all([
+      importAccount({ apiKey: "new-key-5555", label: " OpenCode Go 2 " }),
+      importAccount({ apiKey: " new-key-5555" }),
+      addAccount({ apiKey: "new-key-5555", role: "overage_fallback" }),
+      importAccount({ apiKey: "new-key-5555" }),
+    ])
+    expect(first).toMatchObject({ status: "imported", account: { label: "OpenCode Go 2", role: "primary" } })
+    expect([second, third]).toEqual([{ status: "duplicate" }, { status: "duplicate" }])
+    expect(manual.account.role).toBe("overage_fallback")
+    const accounts = loadAccounts().accounts
+    expect(accounts.slice(0, 4)).toEqual(existing)
+    expect(accounts.slice(4).map((a) => [a.apiKey, a.label, a.role, a.enabled])).toEqual([
+      ["new-key-5555", "OpenCode Go 2", "primary", true],
+      ["new-key-5555", undefined, "overage_fallback", true],
+    ])
+    expect(loadAccounts().rotationIndex).toBe(2)
+  })
+
+  it("starts the rotation hint at the first imported account", async () => {
+    const result = await importAccount({ apiKey: "only-key", label: "Host" })
+    expect(result).toMatchObject({ status: "imported", count: 1, account: { label: "Host", role: "primary", keyHint: "...-key" } })
+    expect(loadAccounts()).toMatchObject({ rotationIndex: 0, accounts: [{ apiKey: "only-key", label: "Host", enabled: true, role: "primary" }] })
   })
 
   it("resolves the last-used account by identity before the legacy index", () => {
